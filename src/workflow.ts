@@ -1,16 +1,33 @@
 import { appendLog, getAgents } from './storage';
-import { captureAgentResponse, sendToAgent } from './runtime';
-import type { ChatAgent, WorkflowDefinition } from './types';
+import { captureAgentResponse, sendToAgent, waitForAgentIdle } from './runtime';
+import type { ChatAgent, RunSource, WorkflowDefinition } from './types';
 
-export async function runWorkflow(workflow: WorkflowDefinition): Promise<void> {
+export type WorkflowRunOptions = {
+  runId?: string;
+  source?: RunSource;
+};
+
+export async function runWorkflow(workflow: WorkflowDefinition, options: WorkflowRunOptions = {}): Promise<void> {
   const agents = await getAgents();
   const byId = new Map(agents.map((agent) => [agent.id, agent]));
   const context = new Map<string, string>();
+  const runId = options.runId ?? crypto.randomUUID();
+  const source = options.source ?? 'workflow';
 
-  await appendLog({ workflowId: workflow.id, level: 'info', event: 'workflow_started' });
+  await appendLog({ workflowId: workflow.id, runId, source, level: 'info', event: 'workflow_started' });
 
   try {
     for (const step of workflow.steps) {
+      await appendLog({
+        workflowId: workflow.id,
+        runId,
+        stepId: step.id,
+        source,
+        level: 'info',
+        event: 'workflow_step_started',
+        detail: step.type,
+      });
+
       switch (step.type) {
         case 'send': {
           const agent = requireAgent(byId, step.agentId);
@@ -19,10 +36,7 @@ export async function runWorkflow(workflow: WorkflowDefinition): Promise<void> {
         }
         case 'wait_idle': {
           const agent = requireAgent(byId, step.agentId);
-          await captureAgentResponse({
-            ...agent,
-            completion: { ...agent.completion, timeoutMs: step.timeoutMs },
-          });
+          await waitForAgentIdle(agent, step.timeoutMs);
           break;
         }
         case 'capture': {
@@ -41,11 +55,23 @@ export async function runWorkflow(workflow: WorkflowDefinition): Promise<void> {
           await sleep(step.milliseconds);
           break;
       }
+
+      await appendLog({
+        workflowId: workflow.id,
+        runId,
+        stepId: step.id,
+        source,
+        level: 'info',
+        event: 'workflow_step_completed',
+        detail: step.type,
+      });
     }
-    await appendLog({ workflowId: workflow.id, level: 'info', event: 'workflow_completed' });
+    await appendLog({ workflowId: workflow.id, runId, source, level: 'info', event: 'workflow_completed' });
   } catch (error) {
     await appendLog({
       workflowId: workflow.id,
+      runId,
+      source,
       level: 'error',
       event: 'workflow_failed',
       detail: error instanceof Error ? error.message : String(error),
