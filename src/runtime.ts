@@ -36,15 +36,11 @@ export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: 
   let idleSince: number | null = null;
 
   while (Date.now() < deadline) {
-    try {
-      const result = await contentCommand(tabId, { type: 'status' });
-      if (result.ok && result.state === 'idle') {
-        idleSince ??= Date.now();
-        if (Date.now() - idleSince >= settleMs) return;
-      } else {
-        idleSince = null;
-      }
-    } catch {
+    const result = await contentCommand(tabId, { type: 'status' }, false);
+    if (result.ok && result.state === 'idle') {
+      idleSince ??= Date.now();
+      if (Date.now() - idleSince >= settleMs) return;
+    } else {
       idleSince = null;
     }
     await sleep(1000);
@@ -52,16 +48,26 @@ export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: 
   throw new Error('Timed out waiting for ChatGPT to become idle.');
 }
 
-async function contentCommand(tabId: number, command: ContentCommand): Promise<ContentResult> {
+async function contentCommand(
+  tabId: number,
+  command: ContentCommand,
+  recover = true,
+): Promise<ContentResult> {
   try {
     return (await chrome.tabs.sendMessage(tabId, command)) as ContentResult;
   } catch (error) {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['content-scripts/chatgpt.js'] }).catch(() => undefined);
-    await sleep(300);
+    if (!recover) return { ok: false, error: error instanceof Error ? error.message : String(error) };
+
     try {
+      await chrome.tabs.reload(tabId);
+      await waitForTabComplete(tabId, 30_000);
+      await sleep(500);
       return (await chrome.tabs.sendMessage(tabId, command)) as ContentResult;
     } catch (retryError) {
-      return { ok: false, error: retryError instanceof Error ? retryError.message : String(retryError ?? error) };
+      return {
+        ok: false,
+        error: retryError instanceof Error ? retryError.message : String(retryError ?? error),
+      };
     }
   }
 }
