@@ -269,3 +269,99 @@ Do not call the extension complete while any of the following is true:
 - developer -> auditor -> developer cannot complete end-to-end without manual copy/paste;
 - no reproducible tests cover selectors, scheduler and workflow routing;
 - critical controls cannot be operated with keyboard/NVDA.
+
+## Coordinator checkpoint — durable MV3 runtime alignment
+
+The runtime/workflow research changes the integration contract in one material way: Nika-agent must be treated as a durable event-driven workflow runtime, not a continuously-running service-worker script.
+
+### Evidence from the current implementation
+
+`src/workflow.ts` currently executes the entire workflow inside one async `for` loop and uses `setTimeout` for `delay`. This is not restart-safe under Manifest V3 service-worker termination. `src/storage.ts` currently stores agents, workflows and logs in `chrome.storage.local`, but has no persisted active-run state, lease state, wake timestamps, retry state or checkpoint snapshots.
+
+### Revised P0 architecture
+
+Before advanced scheduling/UI work, implement a durable execution layer with these properties:
+
+1. Every workflow invocation creates a persistent `RunRecord` with at minimum `runId`, `workflowId`, `currentStepId`, `state`, `targetChatId`, `updatedAt`, `wakeAt`, `retryCount`, `correlationId`, `leaseOwner`, `leaseExpiresAt` and error/provenance fields.
+2. Every side-effecting transition is checkpointed before and after execution.
+3. A service-worker restart must reconstruct incomplete runs and resume from durable state instead of restarting the whole workflow.
+4. `delay` and long waits must persist `wakeAt` and yield; `chrome.alarms` should wake/reconcile due work instead of keeping long `setTimeout` chains alive.
+5. Every send/forward operation must be idempotent. Before retrying after restart, inspect persisted state and target chat identity to avoid duplicate prompts.
+6. Per-chat leases must be durable enough to survive service-worker restarts and must have expiration/reconciliation logic.
+
+### Dependency decision
+
+The research recommends adopting rather than reinventing two infrastructure layers:
+
+- **Dexie.js** for IndexedDB schema, migrations and durable run/schedule data;
+- **XState v5** for restartable workflow state machines / actors and persisted snapshots.
+
+These are now the preferred implementation direction, subject to compile/test validation. The current `package.json` does not yet include either dependency, so this decision is architectural, not yet implemented.
+
+Do not introduce `@statelyai/agent` or an LLM-agent framework into the extension core. Nika-agent controls ChatGPT through the browser UI; internal orchestration should remain deterministic.
+
+### Revised integration sequence
+
+The prior Gates remain valid but Gate 1 is expanded:
+
+**Gate 1A — semantic correctness**
+- separate idle waiting from capture;
+- add retry classification;
+- introduce run/step identifiers;
+- define queue policy.
+
+**Gate 1B — durable runtime**
+- add Dexie schema and migrations;
+- add `RunRecord` / lease / wake state;
+- introduce XState v5 run machine or equivalent persisted deterministic state machine;
+- remove long-lived workflow dependence on `setTimeout` / in-memory context;
+- reconstruct and reconcile active runs on background startup/wake;
+- implement idempotent SEND / CAPTURE / FORWARD transitions.
+
+**Gate 1C — recovery tests**
+- service worker termination immediately after send must not duplicate a prompt;
+- termination while waiting must resume safely;
+- browser restart must reconstruct schedules and active runs;
+- PC sleep across a scheduled run must apply the configured missed-run policy exactly once;
+- two workflows targeting the same chat must obey lease/queue policy.
+
+Only after 1A–1C pass should Gate 2 scheduling expansion be integrated.
+
+### Scheduler contract
+
+IndexedDB is the authoritative scheduling database. `chrome.alarms` is a wake-up mechanism, not the source of truth.
+
+Required missed-run policies:
+- `SKIP`;
+- `RUN_ONCE_NOW`;
+- `CATCH_UP_LIMITED(n)`;
+- `RESCHEDULE_FROM_NOW`.
+
+For ChatGPT automation the safe default should be `RUN_ONCE_NOW` or `SKIP`; never replay an unbounded backlog of prompts after a sleeping/offline PC wakes.
+
+### UI refinement from research
+
+Use two UI surfaces:
+
+- **Side Panel** for operational status, pause/resume, quick sends, active run and errors;
+- **full extension Control Center page** for Projects, Chats, Jobs, Workflows, Schedules, Templates, Runs/History, Settings and import/export.
+
+The workflow editor must be semantic and keyboard-first. Drag-and-drop may be added as an optional enhancement but never as the only editing mechanism.
+
+### Browser-control/reuse policy
+
+Use Playwriter, Microsoft Playwright Chrome Extension, browser-control and Cordyceps as implementation/testing references. Do not make an external relay/MCP/Node process mandatory for normal users unless a later capability proves impossible in pure MV3.
+
+Automa and UI.Vision may inform UX/product decisions, but source reuse must respect their licensing and should not be copied into this repository without an explicit licensing decision.
+
+### Updated merge rejection criteria
+
+Reject any incoming implementation that:
+
+- keeps authoritative workflow progress only in memory;
+- uses long `setTimeout`/`setInterval` chains as the durable scheduler;
+- retries SEND/FORWARD without idempotency checks;
+- uses `tabId` as permanent chat identity;
+- mixes ChatGPT selectors into workflow/scheduler/UI modules;
+- introduces inaccessible custom controls when a native semantic control is sufficient;
+- adds scheduling features before restart/recovery semantics are proven.
