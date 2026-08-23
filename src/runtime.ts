@@ -1,7 +1,14 @@
-import type { ChatAgent, ContentCommand, ContentResult } from './types';
+import type { ChatAgent, ContentCommand, ContentResult, RunSource } from './types';
 import { appendLog } from './storage';
 
 const agentQueues = new Map<string, Promise<void>>();
+
+export type RuntimeExecutionContext = {
+  runId?: string;
+  workflowId?: string;
+  stepId?: string;
+  source?: RunSource;
+};
 
 export async function ensureAgentTab(agent: ChatAgent): Promise<number> {
   const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
@@ -17,21 +24,26 @@ export async function ensureAgentTab(agent: ChatAgent): Promise<number> {
 export async function runAgentExclusive<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
   const previous = agentQueues.get(agentId) ?? Promise.resolve();
   let release!: () => void;
-  const current = new Promise<void>((resolve) => {
+  const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
-  agentQueues.set(agentId, previous.catch(() => undefined).then(() => current));
+  const tail = previous.catch(() => undefined).then(() => gate);
+  agentQueues.set(agentId, tail);
 
   await previous.catch(() => undefined);
   try {
     return await operation();
   } finally {
     release();
-    if (agentQueues.get(agentId) === current) agentQueues.delete(agentId);
+    if (agentQueues.get(agentId) === tail) agentQueues.delete(agentId);
   }
 }
 
-export async function sendToAgent(agent: ChatAgent, prompt: string): Promise<void> {
+export async function sendToAgent(
+  agent: ChatAgent,
+  prompt: string,
+  context: RuntimeExecutionContext = {},
+): Promise<void> {
   return runAgentExclusive(agent.id, async () => {
     const tabId = await ensureAgentTab(agent);
     if (agent.completion.waitForIdle) {
@@ -39,25 +51,44 @@ export async function sendToAgent(agent: ChatAgent, prompt: string): Promise<voi
     }
     const result = await contentCommand(tabId, { type: 'send', prompt }, { recover: false });
     if (!result.ok) throw new Error(result.error);
-    await appendLog({ agentId: agent.id, level: 'info', event: 'prompt_sent', detail: prompt.slice(0, 500) });
+    await appendLog({
+      agentId: agent.id,
+      ...context,
+      level: 'info',
+      event: 'prompt_sent',
+      detail: prompt.slice(0, 500),
+    });
   });
 }
 
-export async function waitForAgentIdle(agent: ChatAgent, timeoutOverride?: number): Promise<void> {
+export async function waitForAgentIdle(
+  agent: ChatAgent,
+  timeoutOverride?: number,
+  context: RuntimeExecutionContext = {},
+): Promise<void> {
   return runAgentExclusive(agent.id, async () => {
     const tabId = await ensureAgentTab(agent);
     await waitUntilIdle(tabId, timeoutOverride ?? agent.completion.timeoutMs, agent.completion.settleMs);
-    await appendLog({ agentId: agent.id, level: 'info', event: 'agent_idle' });
+    await appendLog({ agentId: agent.id, ...context, level: 'info', event: 'agent_idle' });
   });
 }
 
-export async function captureAgentResponse(agent: ChatAgent): Promise<string> {
+export async function captureAgentResponse(
+  agent: ChatAgent,
+  context: RuntimeExecutionContext = {},
+): Promise<string> {
   return runAgentExclusive(agent.id, async () => {
     const tabId = await ensureAgentTab(agent);
     await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs);
     const result = await contentCommand(tabId, { type: 'captureLatest' }, { recover: true });
     if (!result.ok || !result.text) throw new Error(result.ok ? 'Response was empty.' : result.error);
-    await appendLog({ agentId: agent.id, level: 'info', event: 'response_captured', detail: result.text.slice(0, 500) });
+    await appendLog({
+      agentId: agent.id,
+      ...context,
+      level: 'info',
+      event: 'response_captured',
+      detail: result.text.slice(0, 500),
+    });
     return result.text;
   });
 }
