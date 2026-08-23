@@ -18,11 +18,9 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
 
   try {
     for (const step of workflow.steps) {
+      const runtimeContext = { workflowId: workflow.id, runId, stepId: step.id, source } as const;
       await appendLog({
-        workflowId: workflow.id,
-        runId,
-        stepId: step.id,
-        source,
+        ...runtimeContext,
         level: 'info',
         event: 'workflow_step_started',
         detail: step.type,
@@ -31,24 +29,24 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
       switch (step.type) {
         case 'send': {
           const agent = requireAgent(byId, step.agentId);
-          await sendToAgent(agent, interpolate(step.prompt, context));
+          await sendToAgent(agent, interpolate(step.prompt, context), runtimeContext);
           break;
         }
         case 'wait_idle': {
           const agent = requireAgent(byId, step.agentId);
-          await waitForAgentIdle(agent, step.timeoutMs);
+          await waitForAgentIdle(agent, step.timeoutMs, runtimeContext);
           break;
         }
         case 'capture': {
           const agent = requireAgent(byId, step.agentId);
-          context.set(step.outputKey, await captureAgentResponse(agent));
+          context.set(step.outputKey, await captureAgentResponse(agent, runtimeContext));
           break;
         }
         case 'forward': {
           const agent = requireAgent(byId, step.agentId);
           const captured = context.get(step.fromKey);
           if (!captured) throw new Error(`Workflow output '${step.fromKey}' is not available.`);
-          await sendToAgent(agent, `${step.prefix ?? ''}${captured}`);
+          await sendToAgent(agent, `${step.prefix ?? ''}${captured}`, runtimeContext);
           break;
         }
         case 'delay':
@@ -57,10 +55,7 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
       }
 
       await appendLog({
-        workflowId: workflow.id,
-        runId,
-        stepId: step.id,
-        source,
+        ...runtimeContext,
         level: 'info',
         event: 'workflow_step_completed',
         detail: step.type,
