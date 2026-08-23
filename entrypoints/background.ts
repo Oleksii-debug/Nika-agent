@@ -1,36 +1,39 @@
 import { appendLog, getAgents, getWorkflows } from '../src/storage';
 import { sendToAgent } from '../src/runtime';
 import { runWorkflow } from '../src/workflow';
+import {
+  claimNextDueJob,
+  enqueueManualAgent,
+  markJobFailed,
+  markJobRunning,
+  markJobSucceeded,
+  rebuildWakeAlarm,
+  reconcileSchedules,
+  synchronizeSchedules,
+} from '../src/scheduler';
 import type { RunSource } from '../src/types';
 
-const activeManualAgents = new Set<string>();
 const activeManualWorkflows = new Set<string>();
+let draining = false;
 
 export default defineBackground(() => {
-  chrome.runtime.onInstalled.addListener(() => {
-    void rebuildAlarms();
-  });
-
-  chrome.runtime.onStartup.addListener(() => {
-    void rebuildAlarms();
-  });
+  chrome.runtime.onInstalled.addListener(() => { void initializeScheduler(); });
+  chrome.runtime.onStartup.addListener(() => { void initializeScheduler(); });
 
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && (changes['nika.agents'] || changes['nika.workflows'])) {
-      void rebuildAlarms();
-    }
+    if (area === 'local' && changes['nika.agents']) void initializeScheduler();
   });
 
   chrome.alarms.onAlarm.addListener((alarm) => {
-    void handleAlarm(alarm.name);
+    if (alarm.name === 'nika.scheduler' || alarm.name === 'nika.scheduler.safety') void reconcileAndDrain();
   });
 
   chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
     if (!message || typeof message !== 'object') return;
     const msg = message as { type?: string; agentId?: string; workflowId?: string; prompt?: string };
     if (msg.type === 'nika.runAgent' && msg.agentId) {
-      void runManualAgent(msg.agentId, msg.prompt)
-        .then(() => sendResponse({ ok: true }))
+      void enqueueManualAgent(msg.agentId, msg.prompt)
+        .then(async () => { await drainJobs(); sendResponse({ ok: true }); })
         .catch((error) => sendResponse({ ok: false, error: String(error) }));
       return true;
     }
@@ -41,64 +44,62 @@ export default defineBackground(() => {
       return true;
     }
   });
+
+  void initializeScheduler();
 });
 
-async function rebuildAlarms(): Promise<void> {
-  await chrome.alarms.clearAll();
+async function initializeScheduler(): Promise<void> {
   const agents = await getAgents();
-  for (const agent of agents) {
-    if (!agent.enabled || !agent.schedule.enabled) continue;
-    if (agent.schedule.kind === 'interval') {
-      chrome.alarms.create(`agent:${agent.id}`, { periodInMinutes: Math.max(1, agent.schedule.minutes) });
-    } else if (agent.schedule.kind === 'once') {
-      const when = Date.parse(agent.schedule.at);
-      if (Number.isFinite(when) && when > Date.now()) chrome.alarms.create(`agent:${agent.id}`, { when });
+  await synchronizeSchedules(agents);
+  await reconcileAndDrain();
+}
+
+async function reconcileAndDrain(): Promise<void> {
+  const agents = await getAgents();
+  await reconcileSchedules(agents);
+  await drainJobs();
+  await rebuildWakeAlarm();
+}
+
+async function drainJobs(): Promise<void> {
+  if (draining) return;
+  draining = true;
+  try {
+    while (true) {
+      const job = await claimNextDueJob();
+      if (!job) break;
+      const agent = (await getAgents()).find((candidate) => candidate.id === job.agentId);
+      if (!agent || !agent.enabled) {
+        await markJobFailed(job.id, 'Target agent is missing or disabled.');
+        continue;
+      }
+
+      const runId = crypto.randomUUID();
+      await markJobRunning(job, runId);
+      const runtimeContext = { runId, source: job.source as RunSource } as const;
+      await appendLog({ agentId: agent.id, ...runtimeContext, level: 'info', event: 'agent_run_started', detail: `job:${job.id}` });
+      try {
+        await sendToAgent(agent, job.prompt?.trim() || agent.defaultPrompt, runtimeContext);
+        await markJobSucceeded(job.id);
+        await appendLog({ agentId: agent.id, ...runtimeContext, level: 'info', event: 'agent_run_completed', detail: `job:${job.id}` });
+      } catch (error) {
+        await markJobFailed(job.id, error);
+        await appendLog({
+          agentId: agent.id,
+          ...runtimeContext,
+          level: 'error',
+          event: job.source === 'scheduled' ? 'scheduled_run_failed' : 'manual_run_failed',
+          detail: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
-  }
-}
-
-async function handleAlarm(name: string): Promise<void> {
-  if (!name.startsWith('agent:')) return;
-  await runAgentNow(name.slice('agent:'.length), undefined, 'scheduled');
-}
-
-async function runManualAgent(agentId: string, prompt?: string): Promise<void> {
-  if (activeManualAgents.has(agentId)) {
-    throw new Error('A manual run for this agent is already active. Wait for it to finish or use a scheduled run, which is queued.');
-  }
-  activeManualAgents.add(agentId);
-  try {
-    await runAgentNow(agentId, prompt, 'manual');
   } finally {
-    activeManualAgents.delete(agentId);
-  }
-}
-
-async function runAgentNow(agentId: string, prompt: string | undefined, source: RunSource): Promise<void> {
-  const agent = (await getAgents()).find((candidate) => candidate.id === agentId);
-  if (!agent || !agent.enabled) return;
-  const runId = crypto.randomUUID();
-  const runtimeContext = { runId, source } as const;
-  await appendLog({ agentId, ...runtimeContext, level: 'info', event: 'agent_run_started' });
-  try {
-    await sendToAgent(agent, prompt?.trim() || agent.defaultPrompt, runtimeContext);
-    await appendLog({ agentId, ...runtimeContext, level: 'info', event: 'agent_run_completed' });
-  } catch (error) {
-    await appendLog({
-      agentId,
-      ...runtimeContext,
-      level: 'error',
-      event: source === 'scheduled' ? 'scheduled_run_failed' : 'manual_run_failed',
-      detail: error instanceof Error ? error.message : String(error),
-    });
-    throw error;
+    draining = false;
   }
 }
 
 async function runManualWorkflow(workflowId: string): Promise<void> {
-  if (activeManualWorkflows.has(workflowId)) {
-    throw new Error('This workflow already has an active manual run.');
-  }
+  if (activeManualWorkflows.has(workflowId)) throw new Error('This workflow already has an active manual run.');
   activeManualWorkflows.add(workflowId);
   try {
     await runWorkflowNow(workflowId, 'manual');
