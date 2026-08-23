@@ -78,15 +78,15 @@ async function runAgentNow(agentId: string, prompt: string | undefined, source: 
   const agent = (await getAgents()).find((candidate) => candidate.id === agentId);
   if (!agent || !agent.enabled) return;
   const runId = crypto.randomUUID();
-  await appendLog({ agentId, runId, source, level: 'info', event: 'agent_run_started' });
+  const runtimeContext = { runId, source } as const;
+  await appendLog({ agentId, ...runtimeContext, level: 'info', event: 'agent_run_started' });
   try {
-    await sendToAgent(agent, prompt?.trim() || agent.defaultPrompt);
-    await appendLog({ agentId, runId, source, level: 'info', event: 'agent_run_completed' });
+    await sendToAgent(agent, prompt?.trim() || agent.defaultPrompt, runtimeContext);
+    await appendLog({ agentId, ...runtimeContext, level: 'info', event: 'agent_run_completed' });
   } catch (error) {
     await appendLog({
       agentId,
-      runId,
-      source,
+      ...runtimeContext,
       level: 'error',
       event: source === 'scheduled' ? 'scheduled_run_failed' : 'manual_run_failed',
       detail: error instanceof Error ? error.message : String(error),
