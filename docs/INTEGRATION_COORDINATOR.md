@@ -204,3 +204,68 @@ Nika Agent should not be called functionally complete until a user can configure
 11. Review complete logs and errors without opening DevTools.
 
 That scenario is the minimum end-to-end acceptance workflow for the product vision.
+
+## Coordinator checkpoint — 2026-08-24
+
+Live `main` was re-verified before issuing the next integration order. No implementation commit newer than the coordinator plan is currently integrated. The P0 findings above therefore remain open and should be treated as blocking defects, not backlog suggestions.
+
+### Next merge contract
+
+The next implementation merge should be deliberately narrow and must close Gate 1 before adding more UI surface or advanced scheduling.
+
+Required code-level outcomes:
+
+1. Add `waitForAgentIdle(agent, timeoutOverride?)` to `src/runtime.ts` and change workflow `wait_idle` to call it without capturing or logging a response.
+2. Introduce an execution lease keyed by agent id. Every send/capture/wait operation that touches a chat must run under the same arbitration policy.
+3. Define queue policy explicitly. Default recommendation: enqueue scheduled work per agent; reject or surface a clear conflict for duplicate manual starts; never silently send two prompts to the same chat concurrently.
+4. Add `runId` and `stepId` provenance to execution logs so every workflow action can be reconstructed later.
+5. Add bounded retry with exponential backoff for transient content-script/tab messaging failures. Do not retry semantic failures such as missing agent, disabled agent or invalid configuration.
+6. Add unit tests covering idle-wait separation, locking, duplicate-start protection and retry termination.
+
+### Domain contract for the following merge
+
+Only after Gate 1 passes, extend `src/types.ts` with first-class domain entities instead of inflating `ChatAgent`:
+
+- `Project`
+- `PromptTemplate`
+- `AgentJob`
+- `WorkflowSchedule`
+- `RunRecord`
+
+An `AgentJob` should own the scheduled prompt/action, recurrence rules and finite repeat count. `ChatAgent` should represent the destination chat and completion policy, not every future command that may be sent to it.
+
+Recommended trigger model:
+
+- manual;
+- once at timestamp;
+- interval;
+- daily/weekly exact time;
+- after job/workflow completion;
+- after captured response;
+- bounded retry trigger.
+
+Each trigger must support enable/disable and, where meaningful, start window, end window, cooldown and maximum executions.
+
+### Integration conflict resolution
+
+If parallel developers produce overlapping implementations, merge by responsibility rather than commit age:
+
+- DOM selectors and ChatGPT page behavior belong only in `chatgpt.content.ts` or a dedicated adapter module;
+- tab/message/retry/locking behavior belongs in runtime infrastructure;
+- scheduling belongs in a scheduler module, not UI handlers;
+- workflow orchestration must consume runtime/scheduler APIs and must not query DOM directly;
+- popup/options UI may call background commands but must not execute workflow logic itself.
+
+Reject integrations that duplicate these responsibilities across layers even if they appear to work locally.
+
+### Stop conditions for release claims
+
+Do not call the extension complete while any of the following is true:
+
+- workflow alarms cannot run autonomously;
+- the same chat can receive concurrent sends;
+- a wait step creates a fake capture event;
+- the user cannot configure different scheduled commands for one chat;
+- developer -> auditor -> developer cannot complete end-to-end without manual copy/paste;
+- no reproducible tests cover selectors, scheduler and workflow routing;
+- critical controls cannot be operated with keyboard/NVDA.
