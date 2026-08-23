@@ -6,16 +6,17 @@ const SAFETY_WAKE_MINUTES = 1;
 
 export async function synchronizeSchedules(agents: ChatAgent[], now = new Date()): Promise<void> {
   const enabledIds = new Set(agents.filter((agent) => agent.enabled && agent.schedule.enabled).map((agent) => agent.id));
-  await db.scheduleCursors.where('agentId').noneOf([...enabledIds]).delete();
+  const cursors = await db.scheduleCursors.toArray();
+  for (const cursor of cursors) {
+    if (!enabledIds.has(cursor.agentId)) await db.scheduleCursors.delete(cursor.agentId);
+  }
 
   for (const agent of agents) {
     if (!agent.enabled || !agent.schedule.enabled || agent.schedule.kind === 'manual') continue;
     const existing = await db.scheduleCursors.get(agent.id);
     if (existing) continue;
-
     const nextDueAt = initialDueAt(agent, now);
-    if (!nextDueAt) continue;
-    await db.scheduleCursors.put({ agentId: agent.id, nextDueAt, updatedAt: now.toISOString() });
+    if (nextDueAt) await db.scheduleCursors.put({ agentId: agent.id, nextDueAt, updatedAt: now.toISOString() });
   }
 }
 
@@ -35,7 +36,6 @@ export async function rebuildWakeAlarm(): Promise<void> {
 export async function reconcileSchedules(agents: ChatAgent[], now = new Date()): Promise<DurableJob[]> {
   await synchronizeSchedules(agents, now);
   await reclaimExpiredLeases(now);
-
   const byId = new Map(agents.map((agent) => [agent.id, agent]));
   const cursors = await db.scheduleCursors.toArray();
   const materialized: DurableJob[] = [];
@@ -48,20 +48,12 @@ export async function reconcileSchedules(agents: ChatAgent[], now = new Date()):
 
     const occurrenceAt = latestOccurrenceAt(agent, due, now.getTime());
     const occurrenceKey = `${agent.id}:${new Date(occurrenceAt).toISOString()}`;
-    const existing = await db.jobs.where('occurrenceKey').equals(occurrenceKey).first();
-    if (!existing) {
+    if (!(await db.jobs.where('occurrenceKey').equals(occurrenceKey).first())) {
       const timestamp = now.toISOString();
       const job: DurableJob = {
-        id: crypto.randomUUID(),
-        occurrenceKey,
-        agentId: agent.id,
-        source: 'scheduled',
-        dueAt: new Date(occurrenceAt).toISOString(),
-        state: 'pending',
-        attempt: 0,
-        maxAttempts: 1,
-        createdAt: timestamp,
-        updatedAt: timestamp,
+        id: crypto.randomUUID(), occurrenceKey, agentId: agent.id, source: 'scheduled',
+        dueAt: new Date(occurrenceAt).toISOString(), state: 'pending', attempt: 0, maxAttempts: 1,
+        createdAt: timestamp, updatedAt: timestamp,
       };
       await db.jobs.add(job);
       materialized.push(job);
@@ -83,17 +75,8 @@ export async function reconcileSchedules(agents: ChatAgent[], now = new Date()):
 export async function enqueueManualAgent(agentId: string, prompt?: string): Promise<DurableJob> {
   const now = new Date().toISOString();
   const job: DurableJob = {
-    id: crypto.randomUUID(),
-    occurrenceKey: `manual:${crypto.randomUUID()}`,
-    agentId,
-    prompt,
-    source: 'manual',
-    dueAt: now,
-    state: 'pending',
-    attempt: 0,
-    maxAttempts: 1,
-    createdAt: now,
-    updatedAt: now,
+    id: crypto.randomUUID(), occurrenceKey: `manual:${crypto.randomUUID()}`, agentId, prompt,
+    source: 'manual', dueAt: now, state: 'pending', attempt: 0, maxAttempts: 1, createdAt: now, updatedAt: now,
   };
   await db.jobs.add(job);
   return job;
@@ -102,12 +85,15 @@ export async function enqueueManualAgent(agentId: string, prompt?: string): Prom
 export async function claimNextDueJob(now = new Date()): Promise<DurableJob | undefined> {
   const worker = crypto.randomUUID();
   return db.transaction('rw', db.jobs, async () => {
-    const candidates = await db.jobs.where('[state+dueAt]').between(['pending', DexieMinKey], ['pending', now.toISOString()]).sortBy('dueAt');
+    const candidates = await db.jobs.where('state').equals('pending')
+      .filter((candidate) => Date.parse(candidate.dueAt) <= now.getTime())
+      .sortBy('dueAt');
     const job = candidates[0];
     if (!job) return undefined;
 
     const activeForAgent = await db.jobs.where('agentId').equals(job.agentId).filter((candidate) =>
-      candidate.id !== job.id && (candidate.state === 'claimed' || candidate.state === 'running') && !!candidate.leaseUntil && Date.parse(candidate.leaseUntil) > now.getTime(),
+      candidate.id !== job.id && (candidate.state === 'claimed' || candidate.state === 'running') &&
+      !!candidate.leaseUntil && Date.parse(candidate.leaseUntil) > now.getTime(),
     ).first();
     if (activeForAgent) return undefined;
 
@@ -117,8 +103,8 @@ export async function claimNextDueJob(now = new Date()): Promise<DurableJob | un
   });
 }
 
-export async function markJobRunning(job: DurableJob): Promise<void> {
-  await db.jobs.update(job.id, { state: 'running', runId: job.runId ?? crypto.randomUUID(), updatedAt: new Date().toISOString() });
+export async function markJobRunning(job: DurableJob, runId: string): Promise<void> {
+  await db.jobs.update(job.id, { state: 'running', runId, updatedAt: new Date().toISOString() });
 }
 
 export async function markJobSucceeded(jobId: string): Promise<void> {
@@ -127,21 +113,18 @@ export async function markJobSucceeded(jobId: string): Promise<void> {
 
 export async function markJobFailed(jobId: string, error: unknown): Promise<void> {
   await db.jobs.update(jobId, {
-    state: 'failed',
-    leaseOwner: undefined,
-    leaseUntil: undefined,
-    lastError: error instanceof Error ? error.message : String(error),
-    updatedAt: new Date().toISOString(),
+    state: 'failed', leaseOwner: undefined, leaseUntil: undefined,
+    lastError: error instanceof Error ? error.message : String(error), updatedAt: new Date().toISOString(),
   });
 }
 
 async function reclaimExpiredLeases(now: Date): Promise<void> {
-  const leased = await db.jobs.filter((job) => (job.state === 'claimed' || job.state === 'running') && !!job.leaseUntil && Date.parse(job.leaseUntil) <= now.getTime()).toArray();
+  const leased = await db.jobs.filter((job) =>
+    (job.state === 'claimed' || job.state === 'running') && !!job.leaseUntil && Date.parse(job.leaseUntil) <= now.getTime(),
+  ).toArray();
   for (const job of leased) {
     await db.jobs.update(job.id, {
-      state: job.state === 'running' ? 'needs_review' : 'pending',
-      leaseOwner: undefined,
-      leaseUntil: undefined,
+      state: job.state === 'running' ? 'needs_review' : 'pending', leaseOwner: undefined, leaseUntil: undefined,
       updatedAt: now.toISOString(),
       lastError: job.state === 'running' ? 'Worker lease expired after execution started; external effect may be ambiguous.' : job.lastError,
     });
@@ -153,9 +136,7 @@ function initialDueAt(agent: ChatAgent, now: Date): string | undefined {
     const at = Date.parse(agent.schedule.at);
     return Number.isFinite(at) ? new Date(at).toISOString() : undefined;
   }
-  if (agent.schedule.kind === 'interval') {
-    return new Date(now.getTime() + Math.max(1, agent.schedule.minutes) * 60_000).toISOString();
-  }
+  if (agent.schedule.kind === 'interval') return new Date(now.getTime() + Math.max(1, agent.schedule.minutes) * 60_000).toISOString();
   return undefined;
 }
 
@@ -166,12 +147,9 @@ function latestOccurrenceAt(agent: ChatAgent, firstDue: number, now: number): nu
 }
 
 function nextOccurrenceAfter(agent: ChatAgent, occurrence: number, now: number): number | undefined {
-  if (agent.schedule.kind === 'once') return undefined;
   if (agent.schedule.kind !== 'interval') return undefined;
   const interval = Math.max(1, agent.schedule.minutes) * 60_000;
   let next = occurrence + interval;
   while (next <= now) next += interval;
   return next;
 }
-
-const DexieMinKey = -Infinity;
