@@ -69,6 +69,7 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
   try {
     for (; index < pinnedWorkflow.steps.length; index += 1) {
       const step = pinnedWorkflow.steps[index];
+      if (!step) throw new Error(`WORKFLOW_STEP_MISSING: pinned step index ${index} does not exist.`);
       const runtimeContext = { workflowId: pinnedWorkflow.id, runId, stepId: step.id, source: durable.source } as const;
       const current = await getWorkflowRun(runId);
       let resumeAt = current?.currentStepId === step.id ? current.resumeAt : undefined;
@@ -181,7 +182,7 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
     return 'completed';
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const needsReview = message.includes('SEND_AMBIGUOUS') || message.includes('SEND_UNCERTAIN') || message.includes('WORKFLOW_CHECKPOINT_MISMATCH') || message.includes('WORKFLOW_REVISION_INVALID') || message.includes('WORKFLOW_WAIT_INVALID');
+    const needsReview = message.includes('SEND_AMBIGUOUS') || message.includes('SEND_UNCERTAIN') || message.includes('WORKFLOW_CHECKPOINT_MISMATCH') || message.includes('WORKFLOW_REVISION_INVALID') || message.includes('WORKFLOW_WAIT_INVALID') || message.includes('WORKFLOW_STEP_MISSING');
     await failWorkflowRun(runId, error, needsReview);
     await appendLog({ workflowId: pinnedWorkflow.id, runId, source: durable.source, level: 'error', event: needsReview ? 'workflow_needs_review' : 'workflow_failed', detail: message });
     throw error;
