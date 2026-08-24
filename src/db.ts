@@ -53,8 +53,19 @@ export type SendIntent = {
   detail?: string;
 };
 
+export type TargetClaimOwnerKind = 'job' | 'workflow';
+
+export type DurableTargetClaim = {
+  agentId: string;
+  ownerKind: TargetClaimOwnerKind;
+  ownerId: string;
+  operationId: string;
+  acquiredAt: string;
+  updatedAt: string;
+};
+
 export type WorkflowRunState = 'running' | 'completed' | 'failed' | 'needs_review';
-export type WorkflowWaitKind = 'delay' | 'wait_idle';
+export type WorkflowWaitKind = 'delay' | 'wait_idle' | 'target';
 
 export type DurableWorkflowRun = {
   id: string;
@@ -87,6 +98,7 @@ class NikaDatabase extends Dexie {
   jobs!: Table<DurableJob, string>;
   scheduleCursors!: Table<ScheduleCursor, string>;
   sendIntents!: Table<SendIntent, string>;
+  targetClaims!: Table<DurableTargetClaim, string>;
   workflowRuns!: Table<DurableWorkflowRun, string>;
   workflowOutputs!: Table<WorkflowOutput, string>;
 
@@ -130,6 +142,14 @@ class NikaDatabase extends Dexie {
       jobs: '&id,&occurrenceKey,agentId,state,dueAt,leaseUntil,[state+dueAt]',
       scheduleCursors: '&agentId,nextDueAt',
       sendIntents: '&id,jobId,agentId,runId,state,createdAt,[jobId+state]',
+      workflowRuns: '&id,workflowId,workflowRevision,state,updatedAt,wakeAt,[workflowId+state],[state+wakeAt]',
+      workflowOutputs: '&id,[runId+key],runId,key,capturedAt',
+    });
+    this.version(6).stores({
+      jobs: '&id,&occurrenceKey,agentId,state,dueAt,leaseUntil,[state+dueAt]',
+      scheduleCursors: '&agentId,nextDueAt',
+      sendIntents: '&id,jobId,agentId,runId,state,createdAt,[jobId+state]',
+      targetClaims: '&agentId,ownerKind,ownerId,operationId,updatedAt,[ownerKind+ownerId]',
       workflowRuns: '&id,workflowId,workflowRevision,state,updatedAt,wakeAt,[workflowId+state],[state+wakeAt]',
       workflowOutputs: '&id,[runId+key],runId,key,capturedAt',
     });
