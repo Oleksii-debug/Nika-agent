@@ -13,7 +13,7 @@ export default defineContentScript({
   },
 });
 
-const SELECTOR_PROFILE_ID = 'chatgpt-web-2026-08-g10';
+const SELECTOR_PROFILE_ID = 'chatgpt-web-2026-08-g10u1';
 
 const SELECTORS = {
   stop: [
@@ -162,6 +162,19 @@ function allElements<T extends Element>(selectors: readonly string[]): T[] {
   return [];
 }
 
+function unionElements<T extends Element>(selectors: readonly string[]): T[] {
+  const seen = new Set<T>();
+  const result: T[] = [];
+  for (const selector of selectors) {
+    for (const element of Array.from(document.querySelectorAll<T>(selector))) {
+      if (!isVisible(element) || seen.has(element)) continue;
+      seen.add(element);
+      result.push(element);
+    }
+  }
+  return result;
+}
+
 function textOf(element: Element | undefined): string {
   return normalizeText(element instanceof HTMLElement ? element.innerText : element?.textContent ?? '');
 }
@@ -188,7 +201,7 @@ function inspectState(): StateEvidence {
   const send = firstElement<HTMLButtonElement>(SELECTORS.send);
   const assistant = allElements<HTMLElement>(SELECTORS.assistantMessage);
   const users = allElements<HTMLElement>(SELECTORS.userMessage);
-  const surfaceMessages = allElements<HTMLElement>(SELECTORS.surfaceMessages);
+  const surfaceMessages = unionElements<HTMLElement>(SELECTORS.surfaceMessages);
 
   const composerEditable = Boolean(
     composer &&
