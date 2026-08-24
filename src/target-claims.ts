@@ -1,4 +1,5 @@
 import { db, type DurableTargetClaim, type TargetClaimOwnerKind } from './db';
+import { getAgents } from './storage';
 
 export type TargetClaimOwner = {
   ownerKind: TargetClaimOwnerKind;
@@ -16,8 +17,17 @@ export function canonicalTargetKey(url: string): string {
   }
 }
 
-export async function acquireTargetClaim(targetUrl: string, owner: TargetClaimOwner): Promise<boolean> {
-  const targetKey = canonicalTargetKey(targetUrl);
+async function resolveTargetKey(targetUrlOrAgentId: string): Promise<string> {
+  if (/^https?:\/\//i.test(targetUrlOrAgentId)) return canonicalTargetKey(targetUrlOrAgentId);
+  if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+    const agent = (await getAgents()).find((candidate) => candidate.id === targetUrlOrAgentId);
+    if (agent) return canonicalTargetKey(agent.url);
+  }
+  return canonicalTargetKey(targetUrlOrAgentId);
+}
+
+export async function acquireTargetClaim(targetUrlOrAgentId: string, owner: TargetClaimOwner): Promise<boolean> {
+  const targetKey = await resolveTargetKey(targetUrlOrAgentId);
   return db.transaction('rw', db.targetClaims, async () => {
     const existing = await db.targetClaims.get(targetKey);
     if (existing) {
@@ -38,8 +48,8 @@ export async function acquireTargetClaim(targetUrl: string, owner: TargetClaimOw
   });
 }
 
-export async function releaseTargetClaim(targetUrl: string, owner: TargetClaimOwner): Promise<boolean> {
-  const targetKey = canonicalTargetKey(targetUrl);
+export async function releaseTargetClaim(targetUrlOrAgentId: string, owner: TargetClaimOwner): Promise<boolean> {
+  const targetKey = await resolveTargetKey(targetUrlOrAgentId);
   return db.transaction('rw', db.targetClaims, async () => {
     const existing = await db.targetClaims.get(targetKey);
     if (!existing) return true;
@@ -49,8 +59,8 @@ export async function releaseTargetClaim(targetUrl: string, owner: TargetClaimOw
   });
 }
 
-export async function getTargetClaim(targetUrl: string): Promise<DurableTargetClaim | undefined> {
-  return db.targetClaims.get(canonicalTargetKey(targetUrl));
+export async function getTargetClaim(targetUrlOrAgentId: string): Promise<DurableTargetClaim | undefined> {
+  return db.targetClaims.get(await resolveTargetKey(targetUrlOrAgentId));
 }
 
 export async function releaseClaimsForOwner(ownerKind: TargetClaimOwnerKind, ownerId: string): Promise<void> {
