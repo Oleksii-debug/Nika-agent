@@ -39,14 +39,52 @@ export interface WorkflowDefinition {
   steps: WorkflowStep[];
 }
 
+export interface ExecutionMeta {
+  runId?: string;
+  stepId?: string;
+  correlationId?: string;
+}
+
 export interface ExecutionLog {
   id: string;
   timestamp: string;
   agentId?: string;
   workflowId?: string;
+  runId?: string;
+  stepId?: string;
+  correlationId?: string;
   level: 'info' | 'warning' | 'error';
   event: string;
   detail?: string;
+}
+
+export type RunState = 'running' | 'waiting' | 'completed' | 'failed' | 'needs_attention';
+export type RunStepPhase = 'pending' | 'started' | 'completed';
+
+export interface RunRecord {
+  runId: string;
+  workflowId: string;
+  correlationId: string;
+  currentStepIndex: number;
+  currentStepId?: string;
+  currentStepType?: WorkflowStep['type'];
+  stepPhase: RunStepPhase;
+  state: RunState;
+  targetChatId?: string;
+  context: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
+  wakeAt?: string;
+  retryCount: number;
+  lastError?: string;
+}
+
+export interface AgentLease {
+  agentId: string;
+  ownerRunId: string;
+  fencingToken: string;
+  acquiredAt: string;
+  expiresAt: string;
 }
 
 export type ContentCommand =
