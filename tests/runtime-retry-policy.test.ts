@@ -10,4 +10,14 @@ describe('content command retry policy', () => {
     expect(retryPolicyForContentCommand({ type: 'status' })).toBe('read_only');
     expect(retryPolicyForContentCommand({ type: 'captureLatest' })).toBe('read_only');
   });
+
+  it('keeps the mutation/read boundary explicit for future command additions', () => {
+    const sendPolicy = retryPolicyForContentCommand({ type: 'send', prompt: 'mutation' });
+    const readPolicies = [
+      retryPolicyForContentCommand({ type: 'status' }),
+      retryPolicyForContentCommand({ type: 'captureLatest' }),
+    ];
+    expect(sendPolicy).not.toBe('read_only');
+    expect(readPolicies).toEqual(['read_only', 'read_only']);
+  });
 });
