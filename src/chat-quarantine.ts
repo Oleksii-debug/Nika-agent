@@ -1,4 +1,6 @@
 import { db, type AgentQuarantine } from './db';
+import { getAgents } from './storage';
+import { canonicalTargetKey } from './target-claims';
 import type { ChatBlockerKind, ChatState, StateEvidence } from './types';
 
 export type QuarantineDisposition =
@@ -23,47 +25,91 @@ export function quarantineDisposition(evidence: StateEvidence): QuarantineDispos
   }
 }
 
+async function targetAliasIds(agentId: string): Promise<string[]> {
+  if (typeof chrome === 'undefined' || !chrome.storage?.local) return [agentId];
+  const agents = await getAgents();
+  const source = agents.find((agent) => agent.id === agentId);
+  if (!source) return [agentId];
+  const targetKey = canonicalTargetKey(source.url);
+  const aliases = agents
+    .filter((agent) => canonicalTargetKey(agent.url) === targetKey)
+    .map((agent) => agent.id);
+  return aliases.length ? aliases : [agentId];
+}
+
 export async function quarantineAgent(agentId: string, evidence: StateEvidence, now = new Date()): Promise<AgentQuarantine | undefined> {
   const disposition = quarantineDisposition(evidence);
   if (!disposition) return undefined;
+  const aliases = await targetAliasIds(agentId);
   const timestamp = now.toISOString();
-  const existing = await db.agentQuarantines.get(agentId);
-  const quarantine: AgentQuarantine = {
-    agentId,
-    state: evidence.state,
-    blockerKind: disposition.reason,
-    mode: disposition.mode,
-    createdAt: existing?.createdAt ?? timestamp,
-    updatedAt: timestamp,
-  };
-  if (disposition.mode === 'cooldown') {
-    quarantine.resumeAt = new Date(now.getTime() + disposition.cooldownMs).toISOString();
-  }
-  if (evidence.visibleError) quarantine.detail = evidence.visibleError;
-  if (evidence.pageUrl) quarantine.pageUrl = evidence.pageUrl;
-  await db.agentQuarantines.put(quarantine);
-  return quarantine;
+  const existing = (await db.agentQuarantines.bulkGet(aliases)).filter(Boolean) as AgentQuarantine[];
+  const createdAt = existing.map((item) => item.createdAt).sort()[0] ?? timestamp;
+
+  const records = aliases.map<AgentQuarantine>((aliasId) => {
+    const quarantine: AgentQuarantine = {
+      agentId: aliasId,
+      state: evidence.state,
+      blockerKind: disposition.reason,
+      mode: disposition.mode,
+      createdAt,
+      updatedAt: timestamp,
+    };
+    if (disposition.mode === 'cooldown') {
+      quarantine.resumeAt = new Date(now.getTime() + disposition.cooldownMs).toISOString();
+    }
+    if (evidence.visibleError) quarantine.detail = evidence.visibleError;
+    if (evidence.pageUrl) quarantine.pageUrl = evidence.pageUrl;
+    return quarantine;
+  });
+
+  await db.transaction('rw', db.agentQuarantines, async () => {
+    await db.agentQuarantines.bulkPut(records);
+  });
+  return records.find((record) => record.agentId === agentId) ?? records[0];
 }
 
 export async function getActiveAgentQuarantine(agentId: string, now = new Date()): Promise<AgentQuarantine | undefined> {
-  const quarantine = await db.agentQuarantines.get(agentId);
-  if (!quarantine) return undefined;
-  if (quarantine.mode === 'manual') return quarantine;
-  const resumeAt = quarantine.resumeAt ? Date.parse(quarantine.resumeAt) : Number.NaN;
-  if (!Number.isFinite(resumeAt)) return quarantine;
-  if (resumeAt > now.getTime()) return quarantine;
-  await db.agentQuarantines.delete(agentId);
+  const aliases = await targetAliasIds(agentId);
+  const records = (await db.agentQuarantines.bulkGet(aliases)).filter(Boolean) as AgentQuarantine[];
+  if (!records.length) return undefined;
+
+  const manual = records.find((item) => item.mode === 'manual');
+  if (manual) return { ...manual, agentId };
+
+  const activeCooldown = records.find((item) => {
+    const resumeAt = item.resumeAt ? Date.parse(item.resumeAt) : Number.NaN;
+    return !Number.isFinite(resumeAt) || resumeAt > now.getTime();
+  });
+  if (activeCooldown) return { ...activeCooldown, agentId };
+
+  await db.agentQuarantines.bulkDelete(aliases);
   return undefined;
 }
 
 export async function clearAgentQuarantine(agentId: string): Promise<void> {
-  await db.agentQuarantines.delete(agentId);
+  await db.agentQuarantines.bulkDelete(await targetAliasIds(agentId));
 }
 
 export async function listAgentQuarantines(now = new Date()): Promise<AgentQuarantine[]> {
+  if (typeof chrome === 'undefined' || !chrome.storage?.local) {
+    const result: AgentQuarantine[] = [];
+    for (const item of await db.agentQuarantines.toArray()) {
+      const active = await getActiveAgentQuarantine(item.agentId, now);
+      if (active) result.push(active);
+    }
+    return result;
+  }
+
+  const agents = await getAgents();
+  const representativeByTarget = new Map<string, string>();
+  for (const agent of agents) {
+    const key = canonicalTargetKey(agent.url);
+    if (!representativeByTarget.has(key)) representativeByTarget.set(key, agent.id);
+  }
+
   const result: AgentQuarantine[] = [];
-  for (const item of await db.agentQuarantines.toArray()) {
-    const active = await getActiveAgentQuarantine(item.agentId, now);
+  for (const representativeId of representativeByTarget.values()) {
+    const active = await getActiveAgentQuarantine(representativeId, now);
     if (active) result.push(active);
   }
   return result;
