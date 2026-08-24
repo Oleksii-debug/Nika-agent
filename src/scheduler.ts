@@ -1,4 +1,5 @@
 import { db, type DurableJob, type ScheduleCursor } from './db';
+import { getActiveAgentQuarantine } from './chat-quarantine';
 import type { ChatAgent } from './types';
 
 const LEASE_MS = 2 * 60_000;
@@ -18,10 +19,14 @@ export async function synchronizeSchedules(agents: ChatAgent[], now = new Date()
 
 export async function rebuildWakeAlarm(): Promise<void> {
   const cursors = await db.scheduleCursors.toArray();
-  const next = cursors
-    .map((cursor) => cursor.nextDueAt ? Date.parse(cursor.nextDueAt) : Number.POSITIVE_INFINITY)
-    .filter(Number.isFinite)
-    .sort((a, b) => a - b)[0];
+  const quarantineWakeTimes = (await db.agentQuarantines.toArray())
+    .filter((item) => item.mode === 'cooldown' && item.resumeAt)
+    .map((item) => Date.parse(item.resumeAt!))
+    .filter(Number.isFinite);
+  const next = [
+    ...cursors.map((cursor) => cursor.nextDueAt ? Date.parse(cursor.nextDueAt) : Number.POSITIVE_INFINITY),
+    ...quarantineWakeTimes,
+  ].filter(Number.isFinite).sort((a, b) => a - b)[0];
   await chrome.alarms.clear('nika.scheduler');
   const when = typeof next === 'number' && Number.isFinite(next)
     ? Math.max(Date.now() + 1000, next)
@@ -42,23 +47,26 @@ export async function reconcileSchedules(agents: ChatAgent[], now = new Date()):
     const due = Date.parse(cursor.nextDueAt);
     if (!Number.isFinite(due) || due > now.getTime()) continue;
     const occurrenceAt = latestOccurrenceAt(agent, due, now.getTime());
-    const occurrenceKey = `${agent.id}:${new Date(occurrenceAt).toISOString()}`;
-    if (!(await db.jobs.where('occurrenceKey').equals(occurrenceKey).first())) {
-      const timestamp = now.toISOString();
-      const job: DurableJob = {
-        id: crypto.randomUUID(),
-        occurrenceKey,
-        agentId: agent.id,
-        source: 'scheduled',
-        dueAt: new Date(occurrenceAt).toISOString(),
-        state: 'pending',
-        attempt: 0,
-        maxAttempts: 1,
-        createdAt: timestamp,
-        updatedAt: timestamp,
-      };
-      await db.jobs.add(job);
-      materialized.push(job);
+    const quarantine = await getActiveAgentQuarantine(agent.id, now);
+    if (!quarantine) {
+      const occurrenceKey = `${agent.id}:${new Date(occurrenceAt).toISOString()}`;
+      if (!(await db.jobs.where('occurrenceKey').equals(occurrenceKey).first())) {
+        const timestamp = now.toISOString();
+        const job: DurableJob = {
+          id: crypto.randomUUID(),
+          occurrenceKey,
+          agentId: agent.id,
+          source: 'scheduled',
+          dueAt: new Date(occurrenceAt).toISOString(),
+          state: 'pending',
+          attempt: 0,
+          maxAttempts: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        await db.jobs.add(job);
+        materialized.push(job);
+      }
     }
     const next = nextOccurrenceAfter(agent, occurrenceAt, now.getTime());
     const nextCursor: ScheduleCursor = {
@@ -141,6 +149,16 @@ export async function markJobPending(jobId: string, detail?: string): Promise<vo
     delete job.leaseUntil;
     if (detail === undefined) delete job.lastError;
     else job.lastError = detail;
+  });
+}
+
+export async function deferJobUntil(jobId: string, dueAt: string, detail: string): Promise<void> {
+  await replaceJob(jobId, (job) => {
+    job.state = 'pending';
+    job.dueAt = dueAt;
+    delete job.leaseOwner;
+    delete job.leaseUntil;
+    job.lastError = detail;
   });
 }
 
