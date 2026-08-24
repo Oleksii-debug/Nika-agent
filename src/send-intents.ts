@@ -12,19 +12,19 @@ export async function getOrCreateSendIntent(input: {
     if (existing) return existing;
   }
 
-  const now = new Date().toISOString();
+  const timestamp = new Date().toISOString();
   const intent: SendIntent = {
     id: crypto.randomUUID(),
-    jobId: input.jobId,
     agentId: input.agentId,
-    runId: input.runId,
     prompt: input.prompt,
     promptHash: await hashPrompt(input.prompt),
     baselineUserTurnCount: input.baselineUserTurnCount,
     state: 'persisted',
-    createdAt: now,
-    updatedAt: now,
+    createdAt: timestamp,
+    updatedAt: timestamp,
   };
+  if (input.jobId !== undefined) intent.jobId = input.jobId;
+  if (input.runId !== undefined) intent.runId = input.runId;
   await db.sendIntents.add(intent);
   return intent;
 }
@@ -34,13 +34,15 @@ export async function setSendIntentState(
   state: SendIntent['state'],
   detail?: string,
 ): Promise<void> {
-  const now = new Date().toISOString();
-  await db.sendIntents.update(id, {
-    state,
-    detail,
-    updatedAt: now,
-    ...(state === 'confirmed' ? { confirmedAt: now } : {}),
-  });
+  const intent = await db.sendIntents.get(id);
+  if (!intent) throw new Error(`SEND_INTENT_MISSING: ${id}`);
+  const timestamp = new Date().toISOString();
+  intent.state = state;
+  intent.updatedAt = timestamp;
+  if (detail === undefined) delete intent.detail;
+  else intent.detail = detail;
+  if (state === 'confirmed') intent.confirmedAt = timestamp;
+  await db.sendIntents.put(intent);
 }
 
 export async function getSendIntentForJob(jobId: string): Promise<SendIntent | undefined> {
