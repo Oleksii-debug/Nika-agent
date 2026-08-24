@@ -1,6 +1,9 @@
 import Dexie, { type EntityTable } from 'dexie';
 import type { AgentLease, RunRecord } from './types';
 
+const DEFAULT_LEASE_TTL_MS = 180_000;
+const LEASE_HEARTBEAT_MS = 45_000;
+
 class NikaDatabase extends Dexie {
   runs!: EntityTable<RunRecord, 'runId'>;
   leases!: EntityTable<AgentLease, 'agentId'>;
@@ -35,10 +38,10 @@ export async function updateRun(runId: string, patch: Partial<RunRecord>): Promi
 export async function acquireAgentLease(
   agentId: string,
   ownerRunId: string,
-  ttlMs = 120_000,
+  ttlMs = DEFAULT_LEASE_TTL_MS,
 ): Promise<AgentLease | null> {
   const now = Date.now();
-  const lease = await db.transaction('rw', db.leases, async () => {
+  return db.transaction('rw', db.leases, async () => {
     const current = await db.leases.get(agentId);
     if (current && Date.parse(current.expiresAt) > now && current.ownerRunId !== ownerRunId) return null;
 
@@ -52,10 +55,12 @@ export async function acquireAgentLease(
     await db.leases.put(next);
     return next;
   });
-  return lease;
 }
 
-export async function renewAgentLease(lease: AgentLease, ttlMs = 120_000): Promise<AgentLease | null> {
+export async function renewAgentLease(
+  lease: AgentLease,
+  ttlMs = DEFAULT_LEASE_TTL_MS,
+): Promise<AgentLease | null> {
   return db.transaction('rw', db.leases, async () => {
     const current = await db.leases.get(lease.agentId);
     if (!current || current.ownerRunId !== lease.ownerRunId || current.fencingToken !== lease.fencingToken) return null;
@@ -64,6 +69,21 @@ export async function renewAgentLease(lease: AgentLease, ttlMs = 120_000): Promi
     await db.leases.put(renewed);
     return renewed;
   });
+}
+
+export function startLeaseHeartbeat(
+  leases: AgentLease[],
+  onLeaseLost: (lease: AgentLease) => void,
+): () => void {
+  const timer = setInterval(() => {
+    void Promise.all(
+      leases.map(async (lease) => {
+        const renewed = await renewAgentLease(lease);
+        if (!renewed) onLeaseLost(lease);
+      }),
+    );
+  }, LEASE_HEARTBEAT_MS);
+  return () => clearInterval(timer);
 }
 
 export async function releaseAgentLease(lease: AgentLease): Promise<void> {
