@@ -39,14 +39,22 @@ export interface WorkflowDefinition {
   steps: WorkflowStep[];
 }
 
+export interface ExecutionContext {
+  runId?: string | undefined;
+  stepId?: string | undefined;
+  workflowId?: string | undefined;
+}
+
 export interface ExecutionLog {
   id: string;
   timestamp: string;
-  agentId?: string;
-  workflowId?: string;
+  agentId?: string | undefined;
+  workflowId?: string | undefined;
+  runId?: string | undefined;
+  stepId?: string | undefined;
   level: 'info' | 'warning' | 'error';
   event: string;
-  detail?: string;
+  detail?: string | undefined;
 }
 
 export type ContentCommand =
