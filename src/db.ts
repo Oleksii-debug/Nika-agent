@@ -95,7 +95,7 @@ export type AgentQuarantine = {
 };
 
 export type WorkflowRunState = 'running' | 'completed' | 'failed' | 'needs_review';
-export type WorkflowWaitKind = 'delay' | 'wait_idle' | 'target';
+export type WorkflowWaitKind = 'delay' | 'wait_idle' | 'target' | 'quarantine';
 
 export type DurableWorkflowRun = {
   id: string;

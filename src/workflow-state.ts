@@ -53,15 +53,16 @@ export async function checkpointStepStarted(
 export async function checkpointWorkflowWait(
   runId: string,
   waitKind: WorkflowWaitKind,
-  wakeAt: string,
+  wakeAt?: string,
   waitDeadlineAt?: string,
 ): Promise<void> {
   await replaceWorkflowRun(runId, (run) => {
     run.waitKind = waitKind;
-    run.wakeAt = wakeAt;
+    assignOptional(run, 'wakeAt', wakeAt);
     assignOptional(run, 'waitDeadlineAt', waitDeadlineAt);
   });
-  await ensureWorkflowWakeAlarm(runId, wakeAt);
+  if (wakeAt) await ensureWorkflowWakeAlarm(runId, wakeAt);
+  else await chrome.alarms.clear(workflowWakeAlarmName(runId));
 }
 
 export async function clearWorkflowWait(runId: string): Promise<void> {
@@ -158,7 +159,7 @@ async function replaceWorkflowRun(
   await db.workflowRuns.put(run);
 }
 
-function assignOptional<K extends 'resumeAt' | 'waitDeadlineAt'>(
+function assignOptional<K extends 'resumeAt' | 'wakeAt' | 'waitDeadlineAt'>(
   run: DurableWorkflowRun,
   key: K,
   value: string | undefined,
