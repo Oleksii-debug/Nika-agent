@@ -1,5 +1,5 @@
 import { appendLog, getAgents } from './storage';
-import { captureAgentResponse, sendToAgent } from './runtime';
+import { captureAgentResponse, sendToAgent, waitForAgentIdle } from './runtime';
 import type { ChatAgent, WorkflowDefinition } from './types';
 
 export async function runWorkflow(workflow: WorkflowDefinition): Promise<void> {
@@ -19,10 +19,7 @@ export async function runWorkflow(workflow: WorkflowDefinition): Promise<void> {
         }
         case 'wait_idle': {
           const agent = requireAgent(byId, step.agentId);
-          await captureAgentResponse({
-            ...agent,
-            completion: { ...agent.completion, timeoutMs: step.timeoutMs },
-          });
+          await waitForAgentIdle(agent, step.timeoutMs);
           break;
         }
         case 'capture': {
