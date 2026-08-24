@@ -60,8 +60,13 @@ export async function clearAgentQuarantine(agentId: string): Promise<void> {
   await db.agentQuarantines.delete(agentId);
 }
 
-export async function listAgentQuarantines(): Promise<AgentQuarantine[]> {
-  return db.agentQuarantines.toArray();
+export async function listAgentQuarantines(now = new Date()): Promise<AgentQuarantine[]> {
+  const result: AgentQuarantine[] = [];
+  for (const item of await db.agentQuarantines.toArray()) {
+    const active = await getActiveAgentQuarantine(item.agentId, now);
+    if (active) result.push(active);
+  }
+  return result;
 }
 
 export function isHardBlockedChatState(state: ChatState): boolean {
