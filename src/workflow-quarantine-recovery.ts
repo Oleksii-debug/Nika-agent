@@ -6,13 +6,15 @@ import { canonicalTargetKey } from './target-claims';
 export async function listQuarantineWorkflowWaiters(agentId: string): Promise<DurableWorkflowRun[]> {
   if (await getActiveAgentQuarantine(agentId)) return [];
 
-  const agents = await getAgents();
-  const source = agents.find((agent) => agent.id === agentId);
   const matchingAgentIds = new Set<string>([agentId]);
-  if (source) {
-    const targetKey = canonicalTargetKey(source.url);
-    for (const agent of agents) {
-      if (canonicalTargetKey(agent.url) === targetKey) matchingAgentIds.add(agent.id);
+  if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+    const agents = await getAgents();
+    const source = agents.find((agent) => agent.id === agentId);
+    if (source) {
+      const targetKey = canonicalTargetKey(source.url);
+      for (const agent of agents) {
+        if (canonicalTargetKey(agent.url) === targetKey) matchingAgentIds.add(agent.id);
+      }
     }
   }
 
