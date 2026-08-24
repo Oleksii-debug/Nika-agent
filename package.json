@@ -10,6 +10,9 @@
     "compile": "tsc --noEmit",
     "test": "vitest run"
   },
+  "dependencies": {
+    "valibot": "^1.4.2"
+  },
   "devDependencies": {
     "typescript": "^5.9.2",
     "vitest": "^3.2.4",
