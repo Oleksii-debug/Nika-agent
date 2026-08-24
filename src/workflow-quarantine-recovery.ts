@@ -22,21 +22,54 @@ export async function listQuarantineWorkflowWaiters(agentId: string): Promise<Du
   return runs.filter((run) => quarantineWorkflowWaitsOnAnyAgent(run, matchingAgentIds));
 }
 
+/**
+ * Returns quarantine-suspended runs whose durable blocker has disappeared.
+ * Startup/safety reconciliation uses this as the wake authority; popup messages
+ * remain a latency optimization rather than a correctness dependency.
+ */
+export async function listClearedQuarantineWorkflowWaiters(): Promise<DurableWorkflowRun[]> {
+  const runs = await db.workflowRuns.where('state').equals('running').toArray();
+  const candidates = runs.filter((run) => run.waitKind === 'quarantine');
+  if (!candidates.length) return [];
+
+  const cleared: DurableWorkflowRun[] = [];
+  const quarantineByAgent = new Map<string, boolean>();
+
+  for (const run of candidates) {
+    const agentId = quarantineWorkflowTargetAgentId(run);
+    if (!agentId) continue;
+
+    let blocked = quarantineByAgent.get(agentId);
+    if (blocked === undefined) {
+      blocked = Boolean(await getActiveAgentQuarantine(agentId));
+      quarantineByAgent.set(agentId, blocked);
+    }
+    if (!blocked) cleared.push(run);
+  }
+
+  return cleared;
+}
+
 export function quarantineWorkflowWaitsOnAgent(run: DurableWorkflowRun, agentId: string): boolean {
   return quarantineWorkflowWaitsOnAnyAgent(run, new Set([agentId]));
 }
 
-function quarantineWorkflowWaitsOnAnyAgent(run: DurableWorkflowRun, agentIds: ReadonlySet<string>): boolean {
-  if (run.state !== 'running' || run.waitKind !== 'quarantine' || !run.currentStepId) return false;
+export function quarantineWorkflowTargetAgentId(run: DurableWorkflowRun): string | undefined {
+  if (run.state !== 'running' || run.waitKind !== 'quarantine' || !run.currentStepId) return undefined;
   const step = run.workflowSnapshot?.steps[run.nextStepIndex];
-  if (!step || step.id !== run.currentStepId) return false;
+  if (!step || step.id !== run.currentStepId) return undefined;
   switch (step.type) {
     case 'send':
     case 'wait_idle':
     case 'capture':
     case 'forward':
-      return agentIds.has(step.agentId);
+      return step.agentId;
     case 'delay':
-      return false;
+      return undefined;
   }
+}
+
+function quarantineWorkflowWaitsOnAnyAgent(run: DurableWorkflowRun, agentIds: ReadonlySet<string>): boolean {
+  const agentId = quarantineWorkflowTargetAgentId(run);
+  return agentId ? agentIds.has(agentId) : false;
 }
