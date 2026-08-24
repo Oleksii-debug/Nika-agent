@@ -1,14 +1,15 @@
 import { appendLog, getAgents, getWorkflows } from '../src/storage';
+import { acquireAgentLease, purgeExpiredLeases, releaseAgentLease, startLeaseHeartbeat } from '../src/db';
 import { sendToAgent } from '../src/runtime';
-import { runWorkflow } from '../src/workflow';
+import { recoverInterruptedWorkflows, resumeWorkflowRun, runWorkflow } from '../src/workflow';
 
 export default defineBackground(() => {
   chrome.runtime.onInstalled.addListener(() => {
-    void rebuildAlarms();
+    void initializeRuntime();
   });
 
   chrome.runtime.onStartup.addListener(() => {
-    void rebuildAlarms();
+    void initializeRuntime();
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
@@ -25,7 +26,7 @@ export default defineBackground(() => {
     if (!message || typeof message !== 'object') return;
     const msg = message as { type?: string; agentId?: string; workflowId?: string; prompt?: string };
     if (msg.type === 'nika.runAgent' && msg.agentId) {
-      void runAgentNow(msg.agentId, msg.prompt).then(() => sendResponse({ ok: true })).catch((error) => sendResponse({ ok: false, error: String(error) }));
+      void runAgentNow(msg.agentId, msg.prompt, 'manual').then(() => sendResponse({ ok: true })).catch((error) => sendResponse({ ok: false, error: String(error) }));
       return true;
     }
     if (msg.type === 'nika.runWorkflow' && msg.workflowId) {
@@ -35,8 +36,18 @@ export default defineBackground(() => {
   });
 });
 
+async function initializeRuntime(): Promise<void> {
+  await purgeExpiredLeases();
+  await rebuildAlarms();
+  await recoverInterruptedWorkflows();
+}
+
 async function rebuildAlarms(): Promise<void> {
-  await chrome.alarms.clearAll();
+  const alarms = await chrome.alarms.getAll();
+  await Promise.all(
+    alarms.filter((alarm) => alarm.name.startsWith('agent:')).map((alarm) => chrome.alarms.clear(alarm.name)),
+  );
+
   const agents = await getAgents();
   for (const agent of agents) {
     if (!agent.enabled || !agent.schedule.enabled) continue;
@@ -50,23 +61,47 @@ async function rebuildAlarms(): Promise<void> {
 }
 
 async function handleAlarm(name: string): Promise<void> {
-  if (!name.startsWith('agent:')) return;
-  await runAgentNow(name.slice('agent:'.length));
+  if (name.startsWith('agent:')) {
+    await runAgentNow(name.slice('agent:'.length), undefined, 'scheduled');
+    return;
+  }
+  if (name.startsWith('run:')) {
+    await resumeWorkflowRun(name.slice('run:'.length));
+  }
 }
 
-async function runAgentNow(agentId: string, prompt?: string): Promise<void> {
+async function runAgentNow(agentId: string, prompt?: string, source: 'manual' | 'scheduled' = 'manual'): Promise<void> {
   const agent = (await getAgents()).find((candidate) => candidate.id === agentId);
   if (!agent || !agent.enabled) return;
+
+  const ownerRunId = `direct:${crypto.randomUUID()}`;
+  const lease = await acquireAgentLease(agent.id, ownerRunId);
+  if (!lease) {
+    const message = `Agent '${agent.name}' is busy; concurrent ${source} start rejected.`;
+    await appendLog({ agentId, runId: ownerRunId, level: 'warning', event: 'agent_run_conflict', detail: message });
+    throw new Error(message);
+  }
+
+  let leaseLost = false;
+  const stopHeartbeat = startLeaseHeartbeat([lease], () => {
+    leaseLost = true;
+  });
+
   try {
-    await sendToAgent(agent, prompt?.trim() || agent.defaultPrompt);
+    await sendToAgent(agent, prompt?.trim() || agent.defaultPrompt, { runId: ownerRunId });
+    if (leaseLost) throw new Error(`Execution lease for agent '${agent.id}' was lost.`);
   } catch (error) {
     await appendLog({
       agentId,
+      runId: ownerRunId,
       level: 'error',
-      event: 'scheduled_run_failed',
+      event: source === 'scheduled' ? 'scheduled_run_failed' : 'manual_run_failed',
       detail: error instanceof Error ? error.message : String(error),
     });
     throw error;
+  } finally {
+    stopHeartbeat();
+    await releaseAgentLease(lease);
   }
 }
 
