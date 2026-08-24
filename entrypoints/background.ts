@@ -5,6 +5,7 @@ import { ChatSurfaceBlockedError, reconcileSendIntent, sendToAgent } from '../sr
 import { getSendIntentForJob } from '../src/send-intents';
 import { acquireTargetClaim, releaseTargetClaim, type TargetClaimOwner } from '../src/target-claims';
 import { runWorkflow } from '../src/workflow';
+import { listQuarantineWorkflowWaiters } from '../src/workflow-quarantine-recovery';
 import {
   ensureWorkflowWakeAlarm,
   failWorkflowRun,
@@ -55,6 +56,12 @@ export default defineBackground(() => {
       const sourceUrl = sender.tab?.url ?? msg.url;
       if (sourceUrl) void resumeIdleWaitsForUrl(sourceUrl);
       return;
+    }
+    if (msg.type === 'nika.quarantineCleared' && msg.agentId) {
+      void resumeQuarantineWaitsForAgent(msg.agentId)
+        .then((resumed) => sendResponse({ ok: true, resumed }))
+        .catch((error) => sendResponse({ ok: false, error: String(error) }));
+      return true;
     }
     if (msg.type === 'nika.runAgent' && msg.agentId) {
       void enqueueManualAgent(msg.agentId, msg.prompt).then(async () => { await drainJobs(); sendResponse({ ok: true }); }).catch((error) => sendResponse({ ok: false, error: String(error) }));
@@ -124,6 +131,23 @@ async function resumeIdleWaitsForUrl(url: string): Promise<void> {
     if (!matchingAgentIds.has(step.agentId)) continue;
     await resumeWorkflowRun(run.id, true);
   }
+}
+
+async function resumeQuarantineWaitsForAgent(agentId: string): Promise<number> {
+  const waiters = await listQuarantineWorkflowWaiters(agentId);
+  for (const run of waiters) {
+    await appendLog({
+      agentId,
+      workflowId: run.workflowId,
+      runId: run.id,
+      source: run.source,
+      level: 'info',
+      event: 'workflow_quarantine_recovery_wake',
+      detail: `step:${run.currentStepId ?? 'unknown'};agent:${agentId}`,
+    });
+    await resumeWorkflowRun(run.id, true);
+  }
+  return waiters.length;
 }
 
 async function resumeWorkflowRun(runId: string, ignoreWakeAt = false): Promise<void> {
