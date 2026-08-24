@@ -39,12 +39,13 @@ async function jobRecoveryCase(job: DurableJob): Promise<RecoveryCase> {
   const intent = await db.sendIntents.where('jobId').equals(job.id).last();
   const claims = await db.targetClaims.where('[ownerKind+ownerId]').equals(['job', job.id]).toArray();
   const blockers: string[] = [];
-  const actions: RecoveryAction[] = ['cancel'];
+  const actions: RecoveryAction[] = [];
 
   if (intent?.state === 'confirmed') actions.push('mark_confirmed');
   if (intent?.state === 'absent' || intent?.state === 'persisted') actions.push('mark_absent_retry');
-  if (isSafeToRelease(intent)) actions.push('release_if_safe');
-  if (intent?.state === 'dispatching' || intent?.state === 'ambiguous') {
+  if (isSafeToRelease(intent)) {
+    actions.push('cancel', 'release_if_safe');
+  } else {
     blockers.push('External send effect is unresolved; target ownership must remain until transcript reconciliation or explicit confirmation.');
   }
 
@@ -59,12 +60,13 @@ async function workflowRecoveryCase(run: DurableWorkflowRun): Promise<RecoveryCa
   const step = run.currentStepId;
   const intent = step ? await db.sendIntents.where('jobId').equals(`workflow:${run.id}:${step}`).last() : undefined;
   const blockers: string[] = [];
-  const actions: RecoveryAction[] = ['cancel'];
+  const actions: RecoveryAction[] = [];
 
   if (intent?.state === 'confirmed') actions.push('mark_confirmed');
   if (intent?.state === 'absent' || intent?.state === 'persisted') actions.push('mark_absent_retry');
-  if (isSafeToRelease(intent)) actions.push('release_if_safe');
-  if (intent?.state === 'dispatching' || intent?.state === 'ambiguous') {
+  if (isSafeToRelease(intent)) {
+    actions.push('cancel', 'release_if_safe');
+  } else {
     blockers.push('Workflow send effect is unresolved; automatic release is prohibited.');
   }
   if (!run.currentStepId) blockers.push('Workflow has no current step checkpoint; operator must inspect the run before resuming.');
@@ -85,17 +87,17 @@ async function recoverJob(jobId: string, action: RecoveryAction): Promise<void> 
   switch (action) {
     case 'mark_confirmed':
       requireIntentState(intent, ['confirmed']);
-      await db.jobs.update(job.id, { state: 'succeeded', leaseOwner: undefined, leaseUntil: undefined, lastError: undefined, updatedAt: now() });
+      await replaceJobState(job, 'succeeded');
       await releaseAllOwnedClaims('job', job.id, owner);
       return;
     case 'mark_absent_retry':
       requireIntentState(intent, ['persisted', 'absent']);
-      await db.jobs.update(job.id, { state: 'pending', leaseOwner: undefined, leaseUntil: undefined, lastError: 'Operator verified no external effect; safe retry permitted.', updatedAt: now() });
+      await replaceJobState(job, 'pending', 'Operator verified no external effect; safe retry permitted.');
       await releaseAllOwnedClaims('job', job.id, owner);
       return;
     case 'cancel':
       if (!isSafeToRelease(intent)) throw new Error('RECOVERY_UNSAFE_CANCEL: unresolved dispatch cannot release target ownership. Mark confirmed/absent only after evidence is established.');
-      await db.jobs.update(job.id, { state: 'cancelled', leaseOwner: undefined, leaseUntil: undefined, updatedAt: now() });
+      await replaceJobState(job, 'cancelled');
       await releaseAllOwnedClaims('job', job.id, owner);
       return;
     case 'release_if_safe':
@@ -116,17 +118,17 @@ async function recoverWorkflow(runId: string, action: RecoveryAction): Promise<v
   switch (action) {
     case 'mark_confirmed':
       requireIntentState(intent, ['confirmed']);
-      await db.workflowRuns.update(run.id, { state: 'running', lastError: undefined, updatedAt: now() });
+      await replaceWorkflowState(run, 'running');
       if (owner) await releaseAllOwnedClaims('workflow', run.id, owner);
       return;
     case 'mark_absent_retry':
       requireIntentState(intent, ['persisted', 'absent']);
-      await db.workflowRuns.update(run.id, { state: 'running', lastError: 'Operator verified no external effect; current step may retry.', updatedAt: now() });
+      await replaceWorkflowState(run, 'running', 'Operator verified no external effect; current step may retry.');
       if (owner) await releaseAllOwnedClaims('workflow', run.id, owner);
       return;
     case 'cancel':
       if (!isSafeToRelease(intent)) throw new Error('RECOVERY_UNSAFE_CANCEL: unresolved workflow send cannot release target ownership.');
-      await db.workflowRuns.update(run.id, { state: 'failed', lastError: 'Cancelled by operator during recovery.', updatedAt: now() });
+      await replaceWorkflowState(run, 'failed', 'Cancelled by operator during recovery.');
       if (owner) await releaseAllOwnedClaims('workflow', run.id, owner);
       return;
     case 'release_if_safe':
@@ -142,6 +144,22 @@ function isSafeToRelease(intent?: SendIntent): boolean {
 
 function requireIntentState(intent: SendIntent | undefined, states: SendIntent['state'][]): asserts intent is SendIntent {
   if (!intent || !states.includes(intent.state)) throw new Error(`RECOVERY_EVIDENCE_REQUIRED: expected intent state ${states.join(' or ')}.`);
+}
+
+async function replaceJobState(job: DurableJob, state: DurableJob['state'], lastError?: string): Promise<void> {
+  const replacement: DurableJob = { ...job, state, updatedAt: now() };
+  delete replacement.leaseOwner;
+  delete replacement.leaseUntil;
+  if (lastError === undefined) delete replacement.lastError;
+  else replacement.lastError = lastError;
+  await db.jobs.put(replacement);
+}
+
+async function replaceWorkflowState(run: DurableWorkflowRun, state: DurableWorkflowRun['state'], lastError?: string): Promise<void> {
+  const replacement: DurableWorkflowRun = { ...run, state, updatedAt: now() };
+  if (lastError === undefined) delete replacement.lastError;
+  else replacement.lastError = lastError;
+  await db.workflowRuns.put(replacement);
 }
 
 async function releaseAllOwnedClaims(kind: 'job' | 'workflow', ownerId: string, owner: TargetClaimOwner): Promise<void> {
