@@ -2,7 +2,14 @@ import { appendLog, getAgents, getWorkflows } from '../src/storage';
 import { reconcileSendIntent, sendToAgent } from '../src/runtime';
 import { getSendIntentForJob } from '../src/send-intents';
 import { runWorkflow } from '../src/workflow';
-import { failWorkflowRun, getRecoverableWorkflowRuns, verifyWorkflowSnapshot } from '../src/workflow-state';
+import {
+  ensureWorkflowWakeAlarm,
+  failWorkflowRun,
+  getRecoverableWorkflowRuns,
+  getWorkflowRun,
+  verifyWorkflowSnapshot,
+  workflowRunIdFromAlarm,
+} from '../src/workflow-state';
 import {
   claimNextDueJob,
   enqueueManualAgent,
@@ -30,6 +37,11 @@ export default defineBackground(() => {
     if (area === 'local' && changes['nika.agents']) void initializeScheduler();
   });
   chrome.alarms.onAlarm.addListener((alarm) => {
+    const workflowRunId = workflowRunIdFromAlarm(alarm.name);
+    if (workflowRunId) {
+      void resumeWorkflowRun(workflowRunId);
+      return;
+    }
     if (alarm.name === 'nika.scheduler' || alarm.name === 'nika.scheduler.safety') void reconcileAndDrain();
   });
   chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
@@ -63,21 +75,55 @@ async function reconcileAndDrain(): Promise<void> {
 }
 
 async function resumeDurableWorkflows(): Promise<void> {
+  const now = Date.now();
   for (const run of await getRecoverableWorkflowRuns()) {
-    if (activeRecoveredWorkflowRuns.has(run.id)) continue;
+    if (run.wakeAt) {
+      const wakeAt = Date.parse(run.wakeAt);
+      if (!Number.isFinite(wakeAt)) {
+        const detail = `Persisted workflow wake timestamp is invalid: ${run.wakeAt}`;
+        await failWorkflowRun(run.id, detail, true);
+        await appendLog({ workflowId: run.workflowId, runId: run.id, source: run.source, level: 'error', event: 'workflow_resume_blocked', detail });
+        continue;
+      }
+      if (wakeAt > now) {
+        await ensureWorkflowWakeAlarm(run.id, run.wakeAt);
+        continue;
+      }
+    }
+    await resumeWorkflowRun(run.id);
+  }
+}
 
-    if (!(await verifyWorkflowSnapshot(run))) {
-      const detail = 'Pinned workflow snapshot is missing or failed revision verification; automatic resume is blocked.';
+async function resumeWorkflowRun(runId: string): Promise<void> {
+  if (activeRecoveredWorkflowRuns.has(runId)) return;
+  const run = await getWorkflowRun(runId);
+  if (!run || run.state !== 'running') return;
+
+  if (!(await verifyWorkflowSnapshot(run))) {
+    const detail = 'Pinned workflow snapshot is missing or failed revision verification; automatic resume is blocked.';
+    await failWorkflowRun(run.id, detail, true);
+    await appendLog({ workflowId: run.workflowId, runId: run.id, source: run.source, level: 'error', event: 'workflow_resume_blocked', detail });
+    return;
+  }
+
+  if (run.wakeAt) {
+    const wakeAt = Date.parse(run.wakeAt);
+    if (!Number.isFinite(wakeAt)) {
+      const detail = `Persisted workflow wake timestamp is invalid: ${run.wakeAt}`;
       await failWorkflowRun(run.id, detail, true);
       await appendLog({ workflowId: run.workflowId, runId: run.id, source: run.source, level: 'error', event: 'workflow_resume_blocked', detail });
-      continue;
+      return;
     }
-
-    activeRecoveredWorkflowRuns.add(run.id);
-    void runWorkflow(run.workflowSnapshot, { runId: run.id, source: run.source })
-      .catch(() => undefined)
-      .finally(() => activeRecoveredWorkflowRuns.delete(run.id));
+    if (wakeAt > Date.now()) {
+      await ensureWorkflowWakeAlarm(run.id, run.wakeAt);
+      return;
+    }
   }
+
+  activeRecoveredWorkflowRuns.add(run.id);
+  void runWorkflow(run.workflowSnapshot, { runId: run.id, source: run.source })
+    .catch(() => undefined)
+    .finally(() => activeRecoveredWorkflowRuns.delete(run.id));
 }
 
 async function reconcileInterruptedSends(agents: Awaited<ReturnType<typeof getAgents>>): Promise<void> {
