@@ -202,7 +202,7 @@ function workflowSendKey(runId: string, stepId: string): string {
 }
 
 function workflowTargetOwner(runId: string, stepId: string): TargetClaimOwner {
-  return { ownerKind: 'workflow', ownerId: runId, operationId: stepId };
+  return { ownerKind: 'workflow', ownerId: runId, operationId: workflowSendKey(runId, stepId) };
 }
 
 function requireAgent(map: Map<string, ChatAgent>, id: string): ChatAgent {
