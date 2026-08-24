@@ -1,4 +1,5 @@
 import { appendLog, getAgents, getWorkflows } from '../src/storage';
+import { auditAndRepairTargetClaims } from '../src/claim-consistency';
 import { reconcileSendIntent, sendToAgent } from '../src/runtime';
 import { getSendIntentForJob } from '../src/send-intents';
 import { acquireTargetClaim, releaseTargetClaim, type TargetClaimOwner } from '../src/target-claims';
@@ -74,6 +75,15 @@ async function initializeScheduler(): Promise<void> {
 async function reconcileAndDrain(): Promise<void> {
   const agents = await getAgents();
   await reconcileSchedules(agents);
+  const claimAudit = await auditAndRepairTargetClaims();
+  if (claimAudit.released || claimAudit.quarantined) {
+    await appendLog({
+      source: 'scheduled',
+      level: claimAudit.quarantined ? 'warning' : 'info',
+      event: 'target_claim_consistency_audit',
+      detail: `checked=${claimAudit.checked}; released=${claimAudit.released}; quarantined=${claimAudit.quarantined}`,
+    });
+  }
   await reconcileInterruptedSends(agents);
   await drainJobs();
   await resumeDurableWorkflows();
