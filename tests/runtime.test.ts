@@ -100,9 +100,10 @@ describe('runtime safety semantics', () => {
     });
 
     const capture = captureAgentResponse(agent);
+    const rejection = expect(capture).rejects.toThrow('content script unavailable');
     await vi.runAllTimersAsync();
+    await rejection;
 
-    await expect(capture).rejects.toThrow('content script unavailable');
     expect(harness.commands.filter((command) => command.type === 'captureLatest')).toHaveLength(3);
     expect(harness.reload).toHaveBeenCalledTimes(2);
   });
