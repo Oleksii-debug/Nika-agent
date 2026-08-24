@@ -104,13 +104,24 @@ class NikaDatabase extends Dexie {
       workflowRuns: '&id,workflowId,state,updatedAt,[workflowId+state]',
       workflowOutputs: '&id,[runId+key],runId,key,capturedAt',
     });
-    this.version(4).stores({
-      jobs: '&id,&occurrenceKey,agentId,state,dueAt,leaseUntil,[state+dueAt]',
-      scheduleCursors: '&agentId,nextDueAt',
-      sendIntents: '&id,jobId,agentId,runId,state,createdAt,[jobId+state]',
-      workflowRuns: '&id,workflowId,workflowRevision,state,updatedAt,[workflowId+state]',
-      workflowOutputs: '&id,[runId+key],runId,key,capturedAt',
-    });
+    this.version(4)
+      .stores({
+        jobs: '&id,&occurrenceKey,agentId,state,dueAt,leaseUntil,[state+dueAt]',
+        scheduleCursors: '&agentId,nextDueAt',
+        sendIntents: '&id,jobId,agentId,runId,state,createdAt,[jobId+state]',
+        workflowRuns: '&id,workflowId,workflowRevision,state,updatedAt,[workflowId+state]',
+        workflowOutputs: '&id,[runId+key],runId,key,capturedAt',
+      })
+      .upgrade(async (transaction) => {
+        const now = new Date().toISOString();
+        await transaction.table('workflowRuns').toCollection().modify((run: Record<string, unknown>) => {
+          if (run.workflowSnapshot && run.workflowRevision) return;
+          run.workflowRevision = 'legacy-unpinned';
+          if (run.state === 'running') run.state = 'needs_review';
+          run.lastError = 'Workflow run predates immutable definition pinning; automatic resume is unsafe.';
+          run.updatedAt = now;
+        });
+      });
   }
 }
 
