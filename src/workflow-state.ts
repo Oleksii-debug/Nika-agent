@@ -37,10 +37,16 @@ export async function getRecoverableWorkflowRuns(): Promise<DurableWorkflowRun[]
   return db.workflowRuns.where('state').equals('running').toArray();
 }
 
-export async function checkpointStepStarted(runId: string, stepId: string, resumeAt?: string): Promise<void> {
+export async function checkpointStepStarted(
+  runId: string,
+  stepId: string,
+  resumeAt?: string,
+  waitDeadlineAt?: string,
+): Promise<void> {
   await db.workflowRuns.update(runId, {
     currentStepId: stepId,
     resumeAt,
+    waitDeadlineAt,
     updatedAt: new Date().toISOString(),
   });
 }
