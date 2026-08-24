@@ -221,7 +221,7 @@ async function waitForTabComplete(tabId: number, timeoutMs: number): Promise<voi
       chrome.tabs.onUpdated.removeListener(listener);
       reject(new Error('Timed out loading ChatGPT tab.'));
     }, timeoutMs);
-    const listener = (updatedId: number, info: chrome.tabs.TabChangeInfo) => {
+    const listener = (updatedId: number, info: { status?: string }) => {
       if (updatedId === tabId && info.status === 'complete') {
         clearTimeout(timer);
         chrome.tabs.onUpdated.removeListener(listener);
