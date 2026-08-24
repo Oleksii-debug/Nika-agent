@@ -1,4 +1,5 @@
 import { getAgents, saveAgents } from '../../src/storage';
+import { listRecoveryCases, recoverSubject, type RecoveryAction, type RecoveryCase } from '../../src/operator-recovery';
 import type { AgentRole, ChatAgent } from '../../src/types';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -14,12 +15,21 @@ const promptInput = $('agent-prompt') as HTMLTextAreaElement;
 const scheduleKind = $('schedule-kind') as HTMLSelectElement;
 const intervalInput = $('interval-minutes') as HTMLInputElement;
 const enabledInput = $('agent-enabled') as HTMLInputElement;
+const recoverySelect = $('recovery-select') as HTMLSelectElement;
+const recoveryAction = $('recovery-action') as HTMLSelectElement;
+const recoveryDetail = $('recovery-detail');
+const recoverySummary = $('recovery-summary');
 
 let agents: ChatAgent[] = [];
+let recoveryCases: RecoveryCase[] = [];
 
 void refresh();
+void refreshRecovery();
 
 select.addEventListener('change', () => loadSelected());
+recoverySelect.addEventListener('change', () => renderRecoveryCase());
+$('recovery-refresh').addEventListener('click', () => void refreshRecovery());
+$('recovery-apply').addEventListener('click', () => void applyRecovery());
 $('new-agent').addEventListener('click', () => resetEditor());
 $('delete-agent').addEventListener('click', () => void deleteSelected());
 $('run-agent').addEventListener('click', () => void runSelected());
@@ -40,6 +50,83 @@ async function refresh(selectedId?: string): Promise<void> {
   if (selectedId) select.value = selectedId;
   if (select.value) loadSelected();
   else resetEditor();
+}
+
+async function refreshRecovery(): Promise<void> {
+  try {
+    recoveryCases = await listRecoveryCases();
+    recoverySelect.replaceChildren();
+    for (const item of recoveryCases) {
+      const option = document.createElement('option');
+      option.value = `${item.kind}:${item.id}`;
+      option.textContent = `${item.kind === 'job' ? 'Завдання' : 'Сценарій'} — ${item.title}`;
+      recoverySelect.append(option);
+    }
+    recoverySummary.textContent = recoveryCases.length
+      ? `Потребують перевірки: ${recoveryCases.length}.`
+      : 'Немає випадків, які потребують ручного відновлення.';
+    renderRecoveryCase();
+  } catch (error) {
+    setStatus(`Помилка відновлення: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function selectedRecovery(): RecoveryCase | undefined {
+  const value = recoverySelect.value;
+  return recoveryCases.find((item) => `${item.kind}:${item.id}` === value);
+}
+
+function renderRecoveryCase(): void {
+  const item = selectedRecovery();
+  recoveryAction.replaceChildren();
+  recoveryDetail.replaceChildren();
+  if (!item) return;
+
+  const lines = [
+    `Стан: ${item.state}.`,
+    item.detail ? `Причина: ${item.detail}` : '',
+    item.intent ? `Стан відправлення: ${item.intent.state}.` : 'Збереженого відправлення немає.',
+    `Утримуваних цілей: ${item.claims.length}.`,
+    ...item.blockers.map((blocker) => `Блокування: ${blocker}`),
+  ].filter(Boolean);
+  for (const text of lines) {
+    const paragraph = document.createElement('p');
+    paragraph.textContent = text;
+    recoveryDetail.append(paragraph);
+  }
+
+  for (const action of item.allowedActions) {
+    const option = document.createElement('option');
+    option.value = action;
+    option.textContent = recoveryActionLabel(action);
+    recoveryAction.append(option);
+  }
+}
+
+async function applyRecovery(): Promise<void> {
+  const item = selectedRecovery();
+  const action = recoveryAction.value as RecoveryAction;
+  if (!item || !action) {
+    setStatus('Немає доступної дії відновлення.');
+    return;
+  }
+  try {
+    await recoverSubject(item.kind, item.id, action);
+    setStatus(`Дію «${recoveryActionLabel(action)}» виконано.`);
+    await refreshRecovery();
+  } catch (error) {
+    setStatus(`Дію заблоковано: ${error instanceof Error ? error.message : String(error)}`);
+    await refreshRecovery();
+  }
+}
+
+function recoveryActionLabel(action: RecoveryAction): string {
+  switch (action) {
+    case 'mark_confirmed': return 'Позначити підтвердженим';
+    case 'mark_absent_retry': return 'Підтвердити відсутність і дозволити повтор';
+    case 'cancel': return 'Скасувати безпечним способом';
+    case 'release_if_safe': return 'Звільнити ціль, якщо це безпечно';
+  }
 }
 
 function loadSelected(): void {
@@ -111,6 +198,7 @@ async function runSelected(): Promise<void> {
   setStatus(`Запуск: ${agent.name}`);
   const response = await chrome.runtime.sendMessage({ type: 'nika.runAgent', agentId: id }) as { ok: boolean; error?: string };
   setStatus(response.ok ? `Команду надіслано: ${agent.name}` : `Помилка: ${response.error ?? 'невідома'}`);
+  await refreshRecovery();
 }
 
 function setStatus(message: string): void {
