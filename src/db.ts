@@ -54,6 +54,7 @@ export type SendIntent = {
 };
 
 export type WorkflowRunState = 'running' | 'completed' | 'failed' | 'needs_review';
+export type WorkflowWaitKind = 'delay' | 'wait_idle';
 
 export type DurableWorkflowRun = {
   id: string;
@@ -65,6 +66,9 @@ export type DurableWorkflowRun = {
   nextStepIndex: number;
   currentStepId?: string;
   resumeAt?: string;
+  wakeAt?: string;
+  waitKind?: WorkflowWaitKind;
+  waitDeadlineAt?: string;
   lastError?: string;
   createdAt: string;
   updatedAt: string;
@@ -122,6 +126,13 @@ class NikaDatabase extends Dexie {
           run.updatedAt = now;
         });
       });
+    this.version(5).stores({
+      jobs: '&id,&occurrenceKey,agentId,state,dueAt,leaseUntil,[state+dueAt]',
+      scheduleCursors: '&agentId,nextDueAt',
+      sendIntents: '&id,jobId,agentId,runId,state,createdAt,[jobId+state]',
+      workflowRuns: '&id,workflowId,workflowRevision,state,updatedAt,wakeAt,[workflowId+state],[state+wakeAt]',
+      workflowOutputs: '&id,[runId+key],runId,key,capturedAt',
+    });
   }
 }
 
