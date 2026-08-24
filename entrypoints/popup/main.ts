@@ -131,7 +131,12 @@ async function recheckQuarantine(): Promise<void> {
       setStatus(`Чат досі призупинений: ${evidence.visibleError ?? evidence.blockerKind ?? evidence.state}.`);
     } else {
       await clearAgentQuarantine(agent.id);
-      setStatus(`Блокування знято: ${agent.name}. Наступний дозволений запуск знову може працювати.`);
+      const wake = await chrome.runtime.sendMessage({ type: 'nika.quarantineCleared', agentId: agent.id }) as { ok: boolean; resumed?: number; error?: string };
+      if (wake.ok) {
+        setStatus(`Блокування знято: ${agent.name}. Пробуджено сценаріїв: ${wake.resumed ?? 0}.`);
+      } else {
+        setStatus(`Блокування знято: ${agent.name}, але негайне пробудження сценаріїв не вдалося: ${wake.error ?? 'невідома помилка'}.`);
+      }
     }
   } catch (error) {
     setStatus(`Не вдалося безпечно перевірити чат: ${error instanceof Error ? error.message : String(error)}`);
