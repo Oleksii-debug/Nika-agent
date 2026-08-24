@@ -1,5 +1,6 @@
 import 'fake-indexeddb/auto';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { fakeBrowser } from 'wxt/testing/fake-browser';
 import { db } from '../src/db';
 import {
   clearAgentQuarantine,
@@ -8,8 +9,6 @@ import {
   quarantineDisposition,
 } from '../src/chat-quarantine';
 import type { ChatAgent, StateEvidence } from '../src/types';
-
-let storedAgents: ChatAgent[] = [];
 
 function agent(id: string, url: string): ChatAgent {
   return {
@@ -44,17 +43,7 @@ function evidence(blockerKind: NonNullable<StateEvidence['blockerKind']>, state:
 
 describe('durable chat quarantine', () => {
   beforeEach(async () => {
-    storedAgents = [];
-    (globalThis as typeof globalThis & { chrome: unknown }).chrome = {
-      storage: {
-        local: {
-          get: async () => ({ 'nika.agents': storedAgents }),
-          set: async (value: Record<string, unknown>) => {
-            if (Array.isArray(value['nika.agents'])) storedAgents = value['nika.agents'] as ChatAgent[];
-          },
-        },
-      },
-    };
+    fakeBrowser.reset();
     await db.agentQuarantines.clear();
   });
 
@@ -92,11 +81,13 @@ describe('durable chat quarantine', () => {
   });
 
   it('projects one physical target quarantine across URL aliases and clears them together', async () => {
-    storedAgents = [
-      agent('agent-a', 'https://chatgpt.com/c/shared'),
-      agent('agent-b', 'https://chatgpt.com/c/shared/?model=gpt-5#latest'),
-      agent('agent-c', 'https://chatgpt.com/c/other'),
-    ];
+    await chrome.storage.local.set({
+      'nika.agents': [
+        agent('agent-a', 'https://chatgpt.com/c/shared'),
+        agent('agent-b', 'https://chatgpt.com/c/shared/?model=gpt-5#latest'),
+        agent('agent-c', 'https://chatgpt.com/c/other'),
+      ],
+    });
 
     await quarantineAgent('agent-a', evidence('verification', 'verification_required'));
 
