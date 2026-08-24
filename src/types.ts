@@ -54,11 +54,54 @@ export interface ExecutionLog {
   detail?: string;
 }
 
+export type ChatState =
+  | 'idle'
+  | 'generating'
+  | 'blocked'
+  | 'logged_out'
+  | 'rate_limited'
+  | 'navigation_pending'
+  | 'unsupported'
+  | 'unknown';
+
+export type StateEvidence = {
+  state: ChatState;
+  composerPresent: boolean;
+  composerEditable: boolean;
+  sendControlPresent: boolean;
+  stopControlPresent: boolean;
+  assistantTurnCount: number;
+  userTurnCount: number;
+  latestAssistantText?: string;
+  latestUserText?: string;
+  mutationAgeMs?: number;
+  visibleError?: string;
+  confidence: 'high' | 'medium' | 'low';
+};
+
+export type PromptPresenceResult = {
+  presence: 'confirmed' | 'absent' | 'ambiguous';
+  matches: number;
+  userTurnCount: number;
+  detail?: string;
+};
+
 export type ContentCommand =
   | { type: 'status' }
-  | { type: 'send'; prompt: string }
+  | { type: 'send'; prompt: string; promptHash?: string; baselineUserTurnCount?: number }
+  | { type: 'verifyPrompt'; promptHash: string; baselineUserTurnCount: number }
   | { type: 'captureLatest' };
 
 export type ContentResult =
-  | { ok: true; state?: 'generating' | 'idle'; text?: string }
-  | { ok: false; error: string };
+  | {
+      ok: true;
+      state?: ChatState;
+      evidence?: StateEvidence;
+      text?: string;
+      sendStatus?: 'confirmed' | 'ambiguous';
+      userTurnCount?: number;
+      presence?: PromptPresenceResult['presence'];
+      matches?: number;
+      detail?: string;
+    }
+  | { ok: false; error: string; evidence?: StateEvidence };
