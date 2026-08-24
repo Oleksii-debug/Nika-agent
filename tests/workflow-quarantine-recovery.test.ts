@@ -37,7 +37,7 @@ function run(overrides: Partial<DurableWorkflowRun> & Pick<DurableWorkflowRun, '
 
 describe('workflow quarantine recovery', () => {
   beforeEach(async () => {
-    await db.workflowRuns.clear();
+    await Promise.all([db.workflowRuns.clear(), db.agentQuarantines.clear()]);
   });
 
   it('selects only running quarantine waits whose pinned current step targets the cleared agent', async () => {
@@ -49,6 +49,20 @@ describe('workflow quarantine recovery', () => {
     ]);
 
     expect((await listQuarantineWorkflowWaiters('agent-a')).map((item) => item.id)).toEqual(['matching']);
+  });
+
+  it('refuses to wake while durable quarantine is still active', async () => {
+    await db.workflowRuns.put(run({ id: 'blocked' }));
+    await db.agentQuarantines.put({
+      agentId: 'agent-a',
+      state: 'logged_out',
+      blockerKind: 'login',
+      mode: 'manual',
+      createdAt: '2026-08-24T10:00:00.000Z',
+      updatedAt: '2026-08-24T10:00:00.000Z',
+    });
+
+    expect(await listQuarantineWorkflowWaiters('agent-a')).toEqual([]);
   });
 
   it('rejects mismatched or missing durable current-step checkpoints', () => {
