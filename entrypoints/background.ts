@@ -5,8 +5,12 @@ import { ChatSurfaceBlockedError, reconcileSendIntent, sendToAgent } from '../sr
 import { getSendIntentForJob } from '../src/send-intents';
 import { acquireTargetClaim, releaseTargetClaim, type TargetClaimOwner } from '../src/target-claims';
 import { runWorkflow } from '../src/workflow';
-import { listQuarantineWorkflowWaiters } from '../src/workflow-quarantine-recovery';
 import {
+  listClearedQuarantineWorkflowWaiters,
+  listQuarantineWorkflowWaiters,
+} from '../src/workflow-quarantine-recovery';
+import {
+  clearWorkflowWait,
   ensureWorkflowWakeAlarm,
   failWorkflowRun,
   getRecoverableWorkflowRuns,
@@ -101,7 +105,26 @@ async function reconcileAndDrain(): Promise<void> {
 
 async function resumeDurableWorkflows(): Promise<void> {
   const now = Date.now();
+  const clearedQuarantineRuns = new Map(
+    (await listClearedQuarantineWorkflowWaiters()).map((run) => [run.id, run]),
+  );
+
   for (const run of await getRecoverableWorkflowRuns()) {
+    if (run.waitKind === 'quarantine') {
+      if (!clearedQuarantineRuns.has(run.id)) continue;
+      await clearWorkflowWait(run.id);
+      await appendLog({
+        workflowId: run.workflowId,
+        runId: run.id,
+        source: run.source,
+        level: 'info',
+        event: 'workflow_quarantine_recovery_reconciled',
+        detail: `step:${run.currentStepId ?? 'unknown'};source:startup_or_safety_reconcile`,
+      });
+      await resumeWorkflowRun(run.id, true);
+      continue;
+    }
+
     if (run.wakeAt) {
       const wakeAt = Date.parse(run.wakeAt);
       if (!Number.isFinite(wakeAt)) {
@@ -136,6 +159,7 @@ async function resumeIdleWaitsForUrl(url: string): Promise<void> {
 async function resumeQuarantineWaitsForAgent(agentId: string): Promise<number> {
   const waiters = await listQuarantineWorkflowWaiters(agentId);
   for (const run of waiters) {
+    await clearWorkflowWait(run.id);
     await appendLog({
       agentId,
       workflowId: run.workflowId,
