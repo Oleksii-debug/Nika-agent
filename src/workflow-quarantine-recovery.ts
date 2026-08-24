@@ -1,6 +1,8 @@
+import { getActiveAgentQuarantine } from './chat-quarantine';
 import { db, type DurableWorkflowRun } from './db';
 
 export async function listQuarantineWorkflowWaiters(agentId: string): Promise<DurableWorkflowRun[]> {
+  if (await getActiveAgentQuarantine(agentId)) return [];
   const runs = await db.workflowRuns.where('state').equals('running').toArray();
   return runs.filter((run) => quarantineWorkflowWaitsOnAgent(run, agentId));
 }
