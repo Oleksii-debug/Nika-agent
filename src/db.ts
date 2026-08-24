@@ -1,4 +1,5 @@
 import Dexie, { type Table } from 'dexie';
+import type { WorkflowDefinition } from './types';
 
 export type DurableJobState =
   | 'pending'
@@ -57,6 +58,8 @@ export type WorkflowRunState = 'running' | 'completed' | 'failed' | 'needs_revie
 export type DurableWorkflowRun = {
   id: string;
   workflowId: string;
+  workflowRevision: string;
+  workflowSnapshot: WorkflowDefinition;
   source: 'manual' | 'scheduled' | 'workflow';
   state: WorkflowRunState;
   nextStepIndex: number;
@@ -99,6 +102,13 @@ class NikaDatabase extends Dexie {
       scheduleCursors: '&agentId,nextDueAt',
       sendIntents: '&id,jobId,agentId,runId,state,createdAt,[jobId+state]',
       workflowRuns: '&id,workflowId,state,updatedAt,[workflowId+state]',
+      workflowOutputs: '&id,[runId+key],runId,key,capturedAt',
+    });
+    this.version(4).stores({
+      jobs: '&id,&occurrenceKey,agentId,state,dueAt,leaseUntil,[state+dueAt]',
+      scheduleCursors: '&agentId,nextDueAt',
+      sendIntents: '&id,jobId,agentId,runId,state,createdAt,[jobId+state]',
+      workflowRuns: '&id,workflowId,workflowRevision,state,updatedAt,[workflowId+state]',
       workflowOutputs: '&id,[runId+key],runId,key,capturedAt',
     });
   }
