@@ -39,11 +39,18 @@ export interface WorkflowDefinition {
   steps: WorkflowStep[];
 }
 
+export interface ExecutionContext {
+  runId?: string;
+  stepId?: string;
+}
+
 export interface ExecutionLog {
   id: string;
   timestamp: string;
   agentId?: string;
   workflowId?: string;
+  runId?: string;
+  stepId?: string;
   level: 'info' | 'warning' | 'error';
   event: string;
   detail?: string;
