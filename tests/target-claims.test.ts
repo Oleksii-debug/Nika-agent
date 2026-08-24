@@ -6,7 +6,7 @@ import { acquireTargetClaim, getTargetClaim, releaseTargetClaim } from '../src/t
 const target = 'https://chatgpt.com/c/example-chat';
 const targetAlias = 'https://chatgpt.com/c/example-chat/?utm_source=test#fragment';
 const jobOwner = { ownerKind: 'job' as const, ownerId: 'job-1', operationId: 'job:job-1' };
-const workflowOwner = { ownerKind: 'workflow' as const, ownerId: 'run-1', operationId: 'step-1' };
+const workflowOwner = { ownerKind: 'workflow' as const, ownerId: 'run-1', operationId: 'workflow:run-1:step-1' };
 
 describe('durable target claims', () => {
   beforeEach(async () => {

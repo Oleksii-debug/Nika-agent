@@ -25,7 +25,8 @@ describe('operator recovery', () => {
       targetKey: 'https://chatgpt.com/c/abc', ownerKind: 'job', ownerId: 'job-1', operationId: 'job:job-1', acquiredAt: now, updatedAt: now,
     });
 
-    const [recovery] = await listRecoveryCases();
+    const recovery = (await listRecoveryCases())[0];
+    if (!recovery) throw new Error('Expected an operator recovery case.');
     expect(recovery.blockers.length).toBeGreaterThan(0);
     expect(recovery.allowedActions).not.toContain('release_if_safe');
     expect(recovery.allowedActions).not.toContain('cancel');

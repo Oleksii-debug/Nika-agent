@@ -49,10 +49,19 @@ async function jobRecoveryCase(job: DurableJob): Promise<RecoveryCase> {
     blockers.push('External send effect is unresolved; target ownership must remain until transcript reconciliation or explicit confirmation.');
   }
 
-  return {
-    kind: 'job', id: job.id, state: job.state, title: `Job ${job.id}`, detail: job.lastError,
-    agentId: job.agentId, intent, claims, allowedActions: unique(actions), blockers,
+  const recovery: RecoveryCase = {
+    kind: 'job',
+    id: job.id,
+    state: job.state,
+    title: `Job ${job.id}`,
+    agentId: job.agentId,
+    claims,
+    allowedActions: unique(actions),
+    blockers,
   };
+  if (job.lastError !== undefined) recovery.detail = job.lastError;
+  if (intent !== undefined) recovery.intent = intent;
+  return recovery;
 }
 
 async function workflowRecoveryCase(run: DurableWorkflowRun): Promise<RecoveryCase> {
@@ -71,11 +80,20 @@ async function workflowRecoveryCase(run: DurableWorkflowRun): Promise<RecoveryCa
   }
   if (!run.currentStepId) blockers.push('Workflow has no current step checkpoint; operator must inspect the run before resuming.');
 
-  return {
-    kind: 'workflow', id: run.id, state: run.state, title: `Workflow ${run.workflowId}`,
-    detail: run.lastError, workflowId: run.workflowId, currentStepId: run.currentStepId,
-    intent, claims, allowedActions: unique(actions), blockers,
+  const recovery: RecoveryCase = {
+    kind: 'workflow',
+    id: run.id,
+    state: run.state,
+    title: `Workflow ${run.workflowId}`,
+    workflowId: run.workflowId,
+    claims,
+    allowedActions: unique(actions),
+    blockers,
   };
+  if (run.lastError !== undefined) recovery.detail = run.lastError;
+  if (run.currentStepId !== undefined) recovery.currentStepId = run.currentStepId;
+  if (intent !== undefined) recovery.intent = intent;
+  return recovery;
 }
 
 async function recoverJob(jobId: string, action: RecoveryAction): Promise<void> {
