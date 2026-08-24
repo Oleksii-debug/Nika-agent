@@ -1,4 +1,4 @@
-import type { ContentCommand, ContentResult, StateEvidence } from '../src/types';
+import type { ContentCommand, ContentResult, PromptPresenceResult, StateEvidence } from '../src/types';
 
 export default defineContentScript({
   matches: ['https://chatgpt.com/*'],
@@ -108,7 +108,7 @@ function inspectState(): StateEvidence {
         ? 'navigation_pending'
         : 'unknown';
 
-  return {
+  const evidence: StateEvidence = {
     state,
     composerPresent: Boolean(composer),
     composerEditable,
@@ -116,11 +116,14 @@ function inspectState(): StateEvidence {
     stopControlPresent,
     assistantTurnCount: assistant.length,
     userTurnCount: users.length,
-    latestAssistantText: textOf(assistant.at(-1)) || undefined,
-    latestUserText: textOf(users.at(-1)) || undefined,
     mutationAgeMs,
     confidence: state === 'idle' && mutationAgeMs < 500 ? 'medium' : state === 'unknown' ? 'low' : 'high',
   };
+  const latestAssistantText = textOf(assistant.at(-1));
+  const latestUserText = textOf(users.at(-1));
+  if (latestAssistantText) evidence.latestAssistantText = latestAssistantText;
+  if (latestUserText) evidence.latestUserText = latestUserText;
+  return evidence;
 }
 
 function setComposerText(prompt: string): boolean {
@@ -160,22 +163,30 @@ async function sendPrompt(prompt: string, promptHash?: string, baselineUserTurnC
   }
 
   const verification = await waitForPromptPresence(expectedHash, baseline, 5_000);
-  return {
+  const result: ContentResult = {
     ok: true,
     sendStatus: verification.presence === 'confirmed' ? 'confirmed' : 'ambiguous',
     presence: verification.presence,
     matches: verification.matches,
     userTurnCount: verification.userTurnCount,
-    detail: verification.detail,
   };
+  if (verification.detail) result.detail = verification.detail;
+  return result;
 }
 
 async function verifyPrompt(promptHash: string, baselineUserTurnCount: number): Promise<ContentResult> {
-  const result = await findPromptPresence(promptHash, baselineUserTurnCount);
-  return { ok: true, presence: result.presence, matches: result.matches, userTurnCount: result.userTurnCount, detail: result.detail };
+  const presence = await findPromptPresence(promptHash, baselineUserTurnCount);
+  const result: ContentResult = {
+    ok: true,
+    presence: presence.presence,
+    matches: presence.matches,
+    userTurnCount: presence.userTurnCount,
+  };
+  if (presence.detail) result.detail = presence.detail;
+  return result;
 }
 
-async function waitForPromptPresence(promptHash: string, baselineUserTurnCount: number, timeoutMs: number) {
+async function waitForPromptPresence(promptHash: string, baselineUserTurnCount: number, timeoutMs: number): Promise<PromptPresenceResult> {
   const deadline = Date.now() + timeoutMs;
   let result = await findPromptPresence(promptHash, baselineUserTurnCount);
   while (result.presence === 'absent' && Date.now() < deadline) {
@@ -185,19 +196,20 @@ async function waitForPromptPresence(promptHash: string, baselineUserTurnCount: 
   return result;
 }
 
-async function findPromptPresence(promptHash: string, baselineUserTurnCount: number) {
+async function findPromptPresence(promptHash: string, baselineUserTurnCount: number): Promise<PromptPresenceResult> {
   const users = allElements<HTMLElement>(SELECTORS.userMessage);
   const candidates = users.slice(Math.max(0, baselineUserTurnCount));
   let matches = 0;
   for (const candidate of candidates) {
     if ((await hashText(textOf(candidate))) === promptHash) matches += 1;
   }
-  return {
-    presence: matches === 1 ? 'confirmed' as const : matches > 1 ? 'ambiguous' as const : 'absent' as const,
+  const result: PromptPresenceResult = {
+    presence: matches === 1 ? 'confirmed' : matches > 1 ? 'ambiguous' : 'absent',
     matches,
     userTurnCount: users.length,
-    detail: matches > 1 ? 'Multiple matching user turns appeared after the persisted baseline.' : undefined,
   };
+  if (matches > 1) result.detail = 'Multiple matching user turns appeared after the persisted baseline.';
+  return result;
 }
 
 function captureLatest(): ContentResult {
