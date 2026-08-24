@@ -53,7 +53,9 @@ describe('workflow quarantine recovery', () => {
 
   it('rejects mismatched or missing durable current-step checkpoints', () => {
     expect(quarantineWorkflowWaitsOnAgent(run({ id: 'mismatch', currentStepId: 'wait-1' }), 'agent-a')).toBe(false);
-    expect(quarantineWorkflowWaitsOnAgent(run({ id: 'missing', currentStepId: undefined }), 'agent-a')).toBe(false);
+    const missing = run({ id: 'missing' });
+    delete missing.currentStepId;
+    expect(quarantineWorkflowWaitsOnAgent(missing, 'agent-a')).toBe(false);
     expect(quarantineWorkflowWaitsOnAgent(run({ id: 'wrong-index', nextStepIndex: 1 }), 'agent-a')).toBe(false);
   });
 
