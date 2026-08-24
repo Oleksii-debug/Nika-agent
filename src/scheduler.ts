@@ -1,4 +1,4 @@
-import { db, type DurableJob } from './db';
+import { db, type DurableJob, type ScheduleCursor } from './db';
 import type { ChatAgent } from './types';
 
 const LEASE_MS = 2 * 60_000;
@@ -18,9 +18,14 @@ export async function synchronizeSchedules(agents: ChatAgent[], now = new Date()
 
 export async function rebuildWakeAlarm(): Promise<void> {
   const cursors = await db.scheduleCursors.toArray();
-  const next = cursors.map((cursor) => cursor.nextDueAt ? Date.parse(cursor.nextDueAt) : Number.POSITIVE_INFINITY).filter(Number.isFinite).sort((a, b) => a - b)[0];
+  const next = cursors
+    .map((cursor) => cursor.nextDueAt ? Date.parse(cursor.nextDueAt) : Number.POSITIVE_INFINITY)
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b)[0];
   await chrome.alarms.clear('nika.scheduler');
-  const when = Number.isFinite(next) ? Math.max(Date.now() + 1000, next) : Date.now() + SAFETY_WAKE_MINUTES * 60_000;
+  const when = typeof next === 'number' && Number.isFinite(next)
+    ? Math.max(Date.now() + 1000, next)
+    : Date.now() + SAFETY_WAKE_MINUTES * 60_000;
   await chrome.alarms.create('nika.scheduler', { when });
   await chrome.alarms.create('nika.scheduler.safety', { periodInMinutes: SAFETY_WAKE_MINUTES });
 }
@@ -40,20 +45,49 @@ export async function reconcileSchedules(agents: ChatAgent[], now = new Date()):
     const occurrenceKey = `${agent.id}:${new Date(occurrenceAt).toISOString()}`;
     if (!(await db.jobs.where('occurrenceKey').equals(occurrenceKey).first())) {
       const timestamp = now.toISOString();
-      const job: DurableJob = { id: crypto.randomUUID(), occurrenceKey, agentId: agent.id, source: 'scheduled', dueAt: new Date(occurrenceAt).toISOString(), state: 'pending', attempt: 0, maxAttempts: 1, createdAt: timestamp, updatedAt: timestamp };
+      const job: DurableJob = {
+        id: crypto.randomUUID(),
+        occurrenceKey,
+        agentId: agent.id,
+        source: 'scheduled',
+        dueAt: new Date(occurrenceAt).toISOString(),
+        state: 'pending',
+        attempt: 0,
+        maxAttempts: 1,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
       await db.jobs.add(job);
       materialized.push(job);
     }
     const next = nextOccurrenceAfter(agent, occurrenceAt, now.getTime());
-    await db.scheduleCursors.put({ agentId: agent.id, nextDueAt: next ? new Date(next).toISOString() : undefined, lastMaterializedAt: new Date(occurrenceAt).toISOString(), updatedAt: now.toISOString() });
+    const nextCursor: ScheduleCursor = {
+      agentId: agent.id,
+      lastMaterializedAt: new Date(occurrenceAt).toISOString(),
+      updatedAt: now.toISOString(),
+    };
+    if (next !== undefined) nextCursor.nextDueAt = new Date(next).toISOString();
+    await db.scheduleCursors.put(nextCursor);
   }
   await rebuildWakeAlarm();
   return materialized;
 }
 
 export async function enqueueManualAgent(agentId: string, prompt?: string): Promise<DurableJob> {
-  const now = new Date().toISOString();
-  const job: DurableJob = { id: crypto.randomUUID(), occurrenceKey: `manual:${crypto.randomUUID()}`, agentId, prompt, source: 'manual', dueAt: now, state: 'pending', attempt: 0, maxAttempts: 1, createdAt: now, updatedAt: now };
+  const timestamp = new Date().toISOString();
+  const job: DurableJob = {
+    id: crypto.randomUUID(),
+    occurrenceKey: `manual:${crypto.randomUUID()}`,
+    agentId,
+    source: 'manual',
+    dueAt: timestamp,
+    state: 'pending',
+    attempt: 0,
+    maxAttempts: 1,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  if (prompt !== undefined) job.prompt = prompt;
   await db.jobs.add(job);
   return job;
 }
@@ -61,52 +95,112 @@ export async function enqueueManualAgent(agentId: string, prompt?: string): Prom
 export async function claimNextDueJob(now = new Date()): Promise<DurableJob | undefined> {
   const worker = crypto.randomUUID();
   return db.transaction('rw', db.jobs, async () => {
-    const candidates = await db.jobs.where('state').equals('pending').filter((candidate) => Date.parse(candidate.dueAt) <= now.getTime()).sortBy('dueAt');
+    const candidates = await db.jobs
+      .where('state').equals('pending')
+      .filter((candidate) => Date.parse(candidate.dueAt) <= now.getTime())
+      .sortBy('dueAt');
     const job = candidates[0];
     if (!job) return undefined;
-    const activeForAgent = await db.jobs.where('agentId').equals(job.agentId).filter((candidate) => candidate.id !== job.id && (candidate.state === 'claimed' || candidate.state === 'running' || candidate.state === 'reconciling') && (!candidate.leaseUntil || Date.parse(candidate.leaseUntil) > now.getTime())).first();
+    const activeForAgent = await db.jobs.where('agentId').equals(job.agentId).filter((candidate) =>
+      candidate.id !== job.id
+      && (candidate.state === 'claimed' || candidate.state === 'running' || candidate.state === 'reconciling')
+      && (!candidate.leaseUntil || Date.parse(candidate.leaseUntil) > now.getTime()),
+    ).first();
     if (activeForAgent) return undefined;
     const leaseUntil = new Date(now.getTime() + LEASE_MS).toISOString();
-    await db.jobs.update(job.id, { state: 'claimed', leaseOwner: worker, leaseUntil, updatedAt: now.toISOString() });
-    return { ...job, state: 'claimed', leaseOwner: worker, leaseUntil, updatedAt: now.toISOString() };
+    const updatedAt = now.toISOString();
+    await db.jobs.update(job.id, { state: 'claimed', leaseOwner: worker, leaseUntil, updatedAt });
+    return { ...job, state: 'claimed', leaseOwner: worker, leaseUntil, updatedAt };
   });
 }
 
-export async function getReconcilingJobs(): Promise<DurableJob[]> { return db.jobs.where('state').equals('reconciling').toArray(); }
+export async function getReconcilingJobs(): Promise<DurableJob[]> {
+  return db.jobs.where('state').equals('reconciling').toArray();
+}
 
 export async function markJobRunning(job: DurableJob, runId: string): Promise<void> {
-  await db.jobs.update(job.id, { state: 'running', runId, updatedAt: new Date().toISOString() });
+  await replaceJob(job.id, (current) => {
+    current.state = 'running';
+    current.runId = runId;
+  });
 }
 
 export async function markJobReconciling(jobId: string, detail: string): Promise<void> {
-  await db.jobs.update(jobId, { state: 'reconciling', leaseOwner: undefined, leaseUntil: undefined, lastError: detail, updatedAt: new Date().toISOString() });
+  await replaceJob(jobId, (job) => {
+    job.state = 'reconciling';
+    delete job.leaseOwner;
+    delete job.leaseUntil;
+    job.lastError = detail;
+  });
 }
 
 export async function markJobPending(jobId: string, detail?: string): Promise<void> {
-  await db.jobs.update(jobId, { state: 'pending', leaseOwner: undefined, leaseUntil: undefined, lastError: detail, updatedAt: new Date().toISOString() });
+  await replaceJob(jobId, (job) => {
+    job.state = 'pending';
+    delete job.leaseOwner;
+    delete job.leaseUntil;
+    if (detail === undefined) delete job.lastError;
+    else job.lastError = detail;
+  });
 }
 
 export async function markJobNeedsReview(jobId: string, detail: string): Promise<void> {
-  await db.jobs.update(jobId, { state: 'needs_review', leaseOwner: undefined, leaseUntil: undefined, lastError: detail, updatedAt: new Date().toISOString() });
+  await replaceJob(jobId, (job) => {
+    job.state = 'needs_review';
+    delete job.leaseOwner;
+    delete job.leaseUntil;
+    job.lastError = detail;
+  });
 }
 
 export async function markJobSucceeded(jobId: string): Promise<void> {
-  await db.jobs.update(jobId, { state: 'succeeded', leaseOwner: undefined, leaseUntil: undefined, updatedAt: new Date().toISOString() });
+  await replaceJob(jobId, (job) => {
+    job.state = 'succeeded';
+    delete job.leaseOwner;
+    delete job.leaseUntil;
+  });
 }
 
 export async function markJobFailed(jobId: string, error: unknown): Promise<void> {
-  await db.jobs.update(jobId, { state: 'failed', leaseOwner: undefined, leaseUntil: undefined, lastError: error instanceof Error ? error.message : String(error), updatedAt: new Date().toISOString() });
+  await replaceJob(jobId, (job) => {
+    job.state = 'failed';
+    delete job.leaseOwner;
+    delete job.leaseUntil;
+    job.lastError = error instanceof Error ? error.message : String(error);
+  });
 }
 
 async function reclaimExpiredLeases(now: Date): Promise<void> {
-  const leased = await db.jobs.filter((job) => (job.state === 'claimed' || job.state === 'running') && !!job.leaseUntil && Date.parse(job.leaseUntil) <= now.getTime()).toArray();
-  for (const job of leased) {
-    await db.jobs.update(job.id, { state: job.state === 'running' ? 'reconciling' : 'pending', leaseOwner: undefined, leaseUntil: undefined, updatedAt: now.toISOString(), lastError: job.state === 'running' ? 'Worker lease expired after execution started; reconciling persisted send intent before retry.' : job.lastError });
+  const leased = await db.jobs.filter((job) =>
+    (job.state === 'claimed' || job.state === 'running')
+    && !!job.leaseUntil
+    && Date.parse(job.leaseUntil) <= now.getTime(),
+  ).toArray();
+  for (const leasedJob of leased) {
+    await replaceJob(leasedJob.id, (job) => {
+      job.state = leasedJob.state === 'running' ? 'reconciling' : 'pending';
+      delete job.leaseOwner;
+      delete job.leaseUntil;
+      if (leasedJob.state === 'running') {
+        job.lastError = 'Worker lease expired after execution started; reconciling persisted send intent before retry.';
+      }
+    }, now.toISOString());
   }
 }
 
+async function replaceJob(jobId: string, mutate: (job: DurableJob) => void, updatedAt = new Date().toISOString()): Promise<void> {
+  const job = await db.jobs.get(jobId);
+  if (!job) throw new Error(`JOB_MISSING: ${jobId}`);
+  mutate(job);
+  job.updatedAt = updatedAt;
+  await db.jobs.put(job);
+}
+
 function initialDueAt(agent: ChatAgent, now: Date): string | undefined {
-  if (agent.schedule.kind === 'once') { const at = Date.parse(agent.schedule.at); return Number.isFinite(at) ? new Date(at).toISOString() : undefined; }
+  if (agent.schedule.kind === 'once') {
+    const at = Date.parse(agent.schedule.at);
+    return Number.isFinite(at) ? new Date(at).toISOString() : undefined;
+  }
   if (agent.schedule.kind === 'interval') return new Date(now.getTime() + Math.max(1, agent.schedule.minutes) * 60_000).toISOString();
   return undefined;
 }
