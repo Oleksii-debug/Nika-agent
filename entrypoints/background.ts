@@ -2,6 +2,7 @@ import { appendLog, getAgents, getWorkflows } from '../src/storage';
 import { reconcileSendIntent, sendToAgent } from '../src/runtime';
 import { getSendIntentForJob } from '../src/send-intents';
 import { runWorkflow } from '../src/workflow';
+import { getRecoverableWorkflowRuns } from '../src/workflow-state';
 import {
   claimNextDueJob,
   enqueueManualAgent,
@@ -19,6 +20,7 @@ import {
 import type { RunSource } from '../src/types';
 
 const activeManualWorkflows = new Set<string>();
+const activeRecoveredWorkflowRuns = new Set<string>();
 let draining = false;
 
 export default defineBackground(() => {
@@ -56,7 +58,24 @@ async function reconcileAndDrain(): Promise<void> {
   await reconcileSchedules(agents);
   await reconcileInterruptedSends(agents);
   await drainJobs();
+  await resumeDurableWorkflows();
   await rebuildWakeAlarm();
+}
+
+async function resumeDurableWorkflows(): Promise<void> {
+  const definitions = new Map((await getWorkflows()).map((workflow) => [workflow.id, workflow]));
+  for (const run of await getRecoverableWorkflowRuns()) {
+    if (activeRecoveredWorkflowRuns.has(run.id)) continue;
+    const workflow = definitions.get(run.workflowId);
+    if (!workflow || !workflow.enabled) {
+      await appendLog({ workflowId: run.workflowId, runId: run.id, source: run.source, level: 'error', event: 'workflow_resume_blocked', detail: 'Workflow definition is missing or disabled.' });
+      continue;
+    }
+    activeRecoveredWorkflowRuns.add(run.id);
+    void runWorkflow(workflow, { runId: run.id, source: run.source })
+      .catch(() => undefined)
+      .finally(() => activeRecoveredWorkflowRuns.delete(run.id));
+  }
 }
 
 async function reconcileInterruptedSends(agents: Awaited<ReturnType<typeof getAgents>>): Promise<void> {
