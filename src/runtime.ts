@@ -1,6 +1,8 @@
 import type { ChatAgent, ContentCommand, ContentResult } from './types';
 import { appendLog } from './storage';
 
+const agentOperationTails = new Map<string, Promise<void>>();
+
 export async function ensureAgentTab(agent: ChatAgent): Promise<number> {
   const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
   const exact = tabs.find((tab) => tab.url === agent.url && typeof tab.id === 'number');
@@ -13,22 +15,37 @@ export async function ensureAgentTab(agent: ChatAgent): Promise<number> {
 }
 
 export async function sendToAgent(agent: ChatAgent, prompt: string): Promise<void> {
-  const tabId = await ensureAgentTab(agent);
-  if (agent.completion.waitForIdle) {
-    await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs);
-  }
-  const result = await contentCommand(tabId, { type: 'send', prompt });
-  if (!result.ok) throw new Error(result.error);
-  await appendLog({ agentId: agent.id, level: 'info', event: 'prompt_sent', detail: prompt.slice(0, 500) });
+  return withAgentLease(agent.id, async () => {
+    const tabId = await ensureAgentTab(agent);
+    if (agent.completion.waitForIdle) {
+      await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs);
+    }
+    const result = await contentCommand(tabId, { type: 'send', prompt });
+    if (!result.ok) throw new Error(result.error);
+    await appendLog({ agentId: agent.id, level: 'info', event: 'prompt_sent', detail: prompt.slice(0, 500) });
+  });
 }
 
 export async function captureAgentResponse(agent: ChatAgent): Promise<string> {
-  const tabId = await ensureAgentTab(agent);
-  await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs);
-  const result = await contentCommand(tabId, { type: 'captureLatest' });
-  if (!result.ok || !result.text) throw new Error(result.ok ? 'Response was empty.' : result.error);
-  await appendLog({ agentId: agent.id, level: 'info', event: 'response_captured', detail: result.text.slice(0, 500) });
-  return result.text;
+  return withAgentLease(agent.id, async () => {
+    const tabId = await ensureAgentTab(agent);
+    await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs);
+    const result = await contentCommand(tabId, { type: 'captureLatest' });
+    if (!result.ok || !result.text) throw new Error(result.ok ? 'Response was empty.' : result.error);
+    await appendLog({ agentId: agent.id, level: 'info', event: 'response_captured', detail: result.text.slice(0, 500) });
+    return result.text;
+  });
+}
+
+export async function waitForAgentIdle(agent: ChatAgent, timeoutOverride?: number): Promise<void> {
+  return withAgentLease(agent.id, async () => {
+    const tabId = await ensureAgentTab(agent);
+    await waitUntilIdle(
+      tabId,
+      timeoutOverride ?? agent.completion.timeoutMs,
+      agent.completion.settleMs,
+    );
+  });
 }
 
 export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: number): Promise<void> {
@@ -46,6 +63,27 @@ export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: 
     await sleep(1000);
   }
   throw new Error('Timed out waiting for ChatGPT to become idle.');
+}
+
+async function withAgentLease<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = agentOperationTails.get(agentId) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  const tail = previous.catch(() => undefined).then(() => current);
+  agentOperationTails.set(agentId, tail);
+
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (agentOperationTails.get(agentId) === tail) {
+      agentOperationTails.delete(agentId);
+    }
+  }
 }
 
 async function contentCommand(
