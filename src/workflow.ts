@@ -74,7 +74,7 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
       if (!current?.currentStepId) {
         if (step.type === 'delay') resumeAt = new Date(Date.now() + Math.max(0, step.milliseconds)).toISOString();
         if (step.type === 'wait_idle') waitDeadlineAt = new Date(Date.now() + Math.max(1_000, step.timeoutMs)).toISOString();
-        await checkpointStepStarted(runId, step.id, resumeAt);
+        await checkpointStepStarted(runId, step.id, resumeAt, waitDeadlineAt);
         await appendLog({ ...runtimeContext, level: 'info', event: 'workflow_step_started', detail: step.type });
       } else if (current.currentStepId !== step.id) {
         throw new Error(`WORKFLOW_CHECKPOINT_MISMATCH: persisted step '${current.currentStepId}' does not match pinned step '${step.id}'.`);
