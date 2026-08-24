@@ -1,5 +1,7 @@
 import { appendLog, getAgents } from './storage';
 import { captureAgentResponse, inspectAgentState, isStablyIdle, sendToAgent } from './runtime';
+import { getSendIntentForJob } from './send-intents';
+import { acquireTargetClaim, releaseTargetClaim, type TargetClaimOwner } from './target-claims';
 import {
   checkpointStepCompleted,
   checkpointStepStarted,
@@ -16,6 +18,7 @@ import {
 import type { ChatAgent, RunSource, WorkflowDefinition } from './types';
 
 const WAIT_IDLE_POLL_MS = 2_000;
+const TARGET_RETRY_MS = 5_000;
 
 export type WorkflowRunOptions = {
   runId?: string;
@@ -83,7 +86,22 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
       switch (step.type) {
         case 'send': {
           const agent = requireAgent(byId, step.agentId);
-          await sendToAgent(agent, interpolate(step.prompt, context), { ...runtimeContext, jobId: workflowSendKey(runId, step.id) });
+          const sendKey = workflowSendKey(runId, step.id);
+          const owner = workflowTargetOwner(runId, step.id);
+          if (!(await acquireTargetClaim(agent.id, owner))) {
+            const wakeAt = new Date(Date.now() + TARGET_RETRY_MS).toISOString();
+            await checkpointWorkflowWait(runId, 'target', wakeAt);
+            await appendLog({ agentId: agent.id, ...runtimeContext, level: 'info', event: 'workflow_target_suspended', detail: `wakeAt:${wakeAt}` });
+            return 'suspended';
+          }
+          await clearWorkflowWait(runId);
+          try {
+            await sendToAgent(agent, interpolate(step.prompt, context), { ...runtimeContext, jobId: sendKey });
+            await releaseTargetClaim(agent.id, owner);
+          } catch (error) {
+            await releaseWorkflowClaimIfSafe(agent.id, owner, sendKey);
+            throw error;
+          }
           break;
         }
         case 'wait_idle': {
@@ -122,7 +140,22 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
           const agent = requireAgent(byId, step.agentId);
           const captured = context.get(step.fromKey);
           if (!captured) throw new Error(`Workflow output '${step.fromKey}' is not available.`);
-          await sendToAgent(agent, `${step.prefix ?? ''}${captured}`, { ...runtimeContext, jobId: workflowSendKey(runId, step.id) });
+          const sendKey = workflowSendKey(runId, step.id);
+          const owner = workflowTargetOwner(runId, step.id);
+          if (!(await acquireTargetClaim(agent.id, owner))) {
+            const wakeAt = new Date(Date.now() + TARGET_RETRY_MS).toISOString();
+            await checkpointWorkflowWait(runId, 'target', wakeAt);
+            await appendLog({ agentId: agent.id, ...runtimeContext, level: 'info', event: 'workflow_target_suspended', detail: `wakeAt:${wakeAt}` });
+            return 'suspended';
+          }
+          await clearWorkflowWait(runId);
+          try {
+            await sendToAgent(agent, `${step.prefix ?? ''}${captured}`, { ...runtimeContext, jobId: sendKey });
+            await releaseTargetClaim(agent.id, owner);
+          } catch (error) {
+            await releaseWorkflowClaimIfSafe(agent.id, owner, sendKey);
+            throw error;
+          }
           break;
         }
         case 'delay': {
@@ -148,15 +181,28 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
     return 'completed';
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const needsReview = message.includes('SEND_AMBIGUOUS') || message.includes('WORKFLOW_CHECKPOINT_MISMATCH') || message.includes('WORKFLOW_REVISION_INVALID') || message.includes('WORKFLOW_WAIT_INVALID');
+    const needsReview = message.includes('SEND_AMBIGUOUS') || message.includes('SEND_UNCERTAIN') || message.includes('WORKFLOW_CHECKPOINT_MISMATCH') || message.includes('WORKFLOW_REVISION_INVALID') || message.includes('WORKFLOW_WAIT_INVALID');
     await failWorkflowRun(runId, error, needsReview);
     await appendLog({ workflowId: pinnedWorkflow.id, runId, source: durable.source, level: 'error', event: needsReview ? 'workflow_needs_review' : 'workflow_failed', detail: message });
     throw error;
   }
 }
 
+async function releaseWorkflowClaimIfSafe(agentId: string, owner: TargetClaimOwner, sendKey: string): Promise<void> {
+  const intent = await getSendIntentForJob(sendKey);
+  if (!intent || intent.state === 'persisted' || intent.state === 'absent' || intent.state === 'confirmed') {
+    await releaseTargetClaim(agentId, owner);
+    return;
+  }
+  throw new Error('SEND_UNCERTAIN: workflow target remains durably claimed until persisted send intent is reconciled.');
+}
+
 function workflowSendKey(runId: string, stepId: string): string {
   return `workflow:${runId}:${stepId}`;
+}
+
+function workflowTargetOwner(runId: string, stepId: string): TargetClaimOwner {
+  return { ownerKind: 'workflow', ownerId: runId, operationId: stepId };
 }
 
 function requireAgent(map: Map<string, ChatAgent>, id: string): ChatAgent {
