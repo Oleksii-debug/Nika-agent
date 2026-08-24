@@ -56,7 +56,7 @@ export type SendIntent = {
 export type TargetClaimOwnerKind = 'job' | 'workflow';
 
 export type DurableTargetClaim = {
-  agentId: string;
+  targetKey: string;
   ownerKind: TargetClaimOwnerKind;
   ownerId: string;
   operationId: string;
@@ -149,7 +149,7 @@ class NikaDatabase extends Dexie {
       jobs: '&id,&occurrenceKey,agentId,state,dueAt,leaseUntil,[state+dueAt]',
       scheduleCursors: '&agentId,nextDueAt',
       sendIntents: '&id,jobId,agentId,runId,state,createdAt,[jobId+state]',
-      targetClaims: '&agentId,ownerKind,ownerId,operationId,updatedAt,[ownerKind+ownerId]',
+      targetClaims: '&targetKey,ownerKind,ownerId,operationId,updatedAt,[ownerKind+ownerId]',
       workflowRuns: '&id,workflowId,workflowRevision,state,updatedAt,wakeAt,[workflowId+state],[state+wakeAt]',
       workflowOutputs: '&id,[runId+key],runId,key,capturedAt',
     });
