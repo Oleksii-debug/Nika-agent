@@ -1,6 +1,4 @@
-import type { ChatState } from './types';
-
-export type ChatBlockerKind = 'login' | 'rate_limit' | 'verification' | 'access' | 'page_error';
+import type { ChatBlockerKind, ChatState } from './types';
 
 export type ChatSurfaceSignals = {
   url: string;
