@@ -18,9 +18,10 @@ function workflow(id: string, agentId: string): WorkflowDefinition {
 }
 
 function run(overrides: Partial<DurableWorkflowRun> & Pick<DurableWorkflowRun, 'id'>): DurableWorkflowRun {
-  const snapshot = workflow(`wf-${overrides.id}`, 'agent-a');
+  const { id, ...rest } = overrides;
+  const snapshot = workflow(`wf-${id}`, 'agent-a');
   return {
-    id: overrides.id,
+    id,
     workflowId: snapshot.id,
     workflowRevision: 'test-revision',
     workflowSnapshot: snapshot,
@@ -31,7 +32,7 @@ function run(overrides: Partial<DurableWorkflowRun> & Pick<DurableWorkflowRun, '
     waitKind: 'quarantine',
     createdAt: '2026-08-24T10:00:00.000Z',
     updatedAt: '2026-08-24T10:00:00.000Z',
-    ...overrides,
+    ...rest,
   };
 }
 
