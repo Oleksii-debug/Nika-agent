@@ -1,3 +1,4 @@
+import { classifyChatSurface } from '../src/chatgpt-state';
 import type { ContentCommand, ContentResult, PromptPresenceResult, StateEvidence } from '../src/types';
 
 export default defineContentScript({
@@ -12,11 +13,14 @@ export default defineContentScript({
   },
 });
 
+const SELECTOR_PROFILE_ID = 'chatgpt-web-2026-08-g10';
+
 const SELECTORS = {
   stop: [
     'button[data-testid="stop-button"]',
     'button[aria-label*="Stop"]',
     'button[aria-label*="Зупин"]',
+    'button[aria-label*="Припин"]',
   ],
   composer: [
     '#prompt-textarea',
@@ -28,6 +32,7 @@ const SELECTORS = {
     'button[data-testid="send-button"]',
     'button[aria-label*="Send"]',
     'button[aria-label*="Надісл"]',
+    'button[aria-label*="Відправ"]',
   ],
   assistantMessage: [
     '[data-message-author-role="assistant"]',
@@ -37,7 +42,73 @@ const SELECTORS = {
     '[data-message-author-role="user"]',
     'article [data-message-author-role="user"]',
   ],
+  login: [
+    'a[href*="/auth/login"]',
+    'button[data-testid*="login"]',
+    'a[data-testid*="login"]',
+  ],
+  verification: [
+    'iframe[src*="challenges.cloudflare.com"]',
+    'iframe[src*="captcha"]',
+    'input[name="cf-turnstile-response"]',
+    '[data-sitekey]',
+    '[class*="turnstile"]',
+  ],
+  surfaceMessages: [
+    '[role="alert"]',
+    '[role="dialog"]',
+    '[aria-live="assertive"]',
+    '[data-testid*="toast"]',
+    '[data-testid*="error"]',
+  ],
 } as const;
+
+const RATE_LIMIT_PATTERNS = [
+  /too many requests/i,
+  /rate[ -]?limit/i,
+  /try again later/i,
+  /you(?:'|’)ve reached.*limit/i,
+  /забагато (?:спроб|запитів)/i,
+  /спробуйте пізніше/i,
+  /досяг(?:ли|нуто).*ліміт/i,
+  /ліміт (?:запитів|повідомлень)/i,
+];
+
+const ACCESS_DENIED_PATTERNS = [
+  /access denied/i,
+  /access.*unavailable/i,
+  /not available in your (?:country|region)/i,
+  /account (?:has been )?(?:deactivated|disabled|suspended)/i,
+  /доступ заборонено/i,
+  /недоступн(?:о|ий).*регіон/i,
+  /обліковий запис.*(?:деактивовано|вимкнено|призупинено)/i,
+];
+
+const PAGE_ERROR_PATTERNS = [
+  /something went wrong/i,
+  /unable to load/i,
+  /failed to load/i,
+  /network error/i,
+  /щось пішло не так/i,
+  /не вдалося завантажити/i,
+  /помилка мережі/i,
+];
+
+const VERIFICATION_TEXT_PATTERNS = [
+  /verify (?:that )?you are human/i,
+  /security check/i,
+  /complete the challenge/i,
+  /перевір(?:те|ка), що ви людина/i,
+  /перевірка безпеки/i,
+  /пройдіть перевірку/i,
+];
+
+const LOGIN_TEXT_PATTERNS = [
+  /^log in$/i,
+  /^sign in$/i,
+  /^увійти$/i,
+  /^вхід$/i,
+];
 
 const IDLE_CANDIDATE_DEBOUNCE_MS = 3_000;
 let lastRelevantMutationAt = Date.now();
@@ -64,12 +135,20 @@ function startMutationTracking(): void {
 function isRelevantMutation(record: MutationRecord): boolean {
   const target = record.target instanceof Element ? record.target : record.target.parentElement;
   if (!target) return false;
-  return Boolean(target.closest('[data-message-author-role], main, form'));
+  return Boolean(target.closest('[data-message-author-role], main, form, [role="alert"], [role="dialog"], [aria-live]'));
+}
+
+function isVisible(element: Element): boolean {
+  if (!(element instanceof HTMLElement)) return true;
+  if (element.hidden || element.getAttribute('aria-hidden') === 'true') return false;
+  const style = getComputedStyle(element);
+  return style.display !== 'none' && style.visibility !== 'hidden';
 }
 
 function firstElement<T extends Element>(selectors: readonly string[]): T | null {
   for (const selector of selectors) {
-    const element = document.querySelector<T>(selector);
+    const elements = Array.from(document.querySelectorAll<T>(selector));
+    const element = elements.find((candidate) => isVisible(candidate));
     if (element) return element;
   }
   return null;
@@ -77,14 +156,30 @@ function firstElement<T extends Element>(selectors: readonly string[]): T | null
 
 function allElements<T extends Element>(selectors: readonly string[]): T[] {
   for (const selector of selectors) {
-    const elements = Array.from(document.querySelectorAll<T>(selector));
+    const elements = Array.from(document.querySelectorAll<T>(selector)).filter((candidate) => isVisible(candidate));
     if (elements.length) return elements;
   }
   return [];
 }
 
 function textOf(element: Element | undefined): string {
-  return (element instanceof HTMLElement ? element.innerText : element?.textContent ?? '').trim();
+  return normalizeText(element instanceof HTMLElement ? element.innerText : element?.textContent ?? '');
+}
+
+function firstMatchingText(elements: Element[], patterns: readonly RegExp[]): string | undefined {
+  for (const element of elements) {
+    const text = textOf(element);
+    if (text && patterns.some((pattern) => pattern.test(text))) return text.slice(0, 500);
+  }
+  return undefined;
+}
+
+function hasTextControl(patterns: readonly RegExp[]): boolean {
+  const controls = Array.from(document.querySelectorAll<HTMLElement>('button, a')).filter((element) => isVisible(element));
+  return controls.some((element) => {
+    const label = normalizeText(element.getAttribute('aria-label') ?? element.innerText ?? element.textContent ?? '');
+    return patterns.some((pattern) => pattern.test(label));
+  });
 }
 
 function inspectState(): StateEvidence {
@@ -93,36 +188,57 @@ function inspectState(): StateEvidence {
   const send = firstElement<HTMLButtonElement>(SELECTORS.send);
   const assistant = allElements<HTMLElement>(SELECTORS.assistantMessage);
   const users = allElements<HTMLElement>(SELECTORS.userMessage);
+  const surfaceMessages = allElements<HTMLElement>(SELECTORS.surfaceMessages);
+
   const composerEditable = Boolean(
     composer &&
-      !(composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement ? composer.disabled || composer.readOnly : composer.getAttribute('contenteditable') === 'false'),
+      !(composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+        ? composer.disabled || composer.readOnly
+        : composer.getAttribute('contenteditable') === 'false'),
   );
   const mutationAgeMs = Date.now() - lastRelevantMutationAt;
   const stopControlPresent = Boolean(stop && !stop.disabled);
+  const loginControlPresent = Boolean(firstElement(SELECTORS.login)) || hasTextControl(LOGIN_TEXT_PATTERNS);
+  const verificationText = firstMatchingText(surfaceMessages, VERIFICATION_TEXT_PATTERNS);
+  const verificationPresent = Boolean(firstElement(SELECTORS.verification) || verificationText);
+  const rateLimitText = firstMatchingText(surfaceMessages, RATE_LIMIT_PATTERNS);
+  const accessDeniedText = firstMatchingText(surfaceMessages, ACCESS_DENIED_PATTERNS);
+  const pageErrorText = firstMatchingText(surfaceMessages, PAGE_ERROR_PATTERNS);
 
-  const state = stopControlPresent
-    ? 'generating'
-    : composer && composerEditable
-      ? 'idle'
-      : document.readyState !== 'complete'
-        ? 'navigation_pending'
-        : 'unknown';
-
-  const evidence: StateEvidence = {
-    state,
+  const classificationInput = {
+    url: location.href,
+    readyState: document.readyState,
+    stopControlPresent,
     composerPresent: Boolean(composer),
     composerEditable,
-    sendControlPresent: Boolean(send),
+    loginControlPresent,
+    verificationPresent,
+    ...(rateLimitText ? { rateLimitText } : {}),
+    ...(accessDeniedText ? { accessDeniedText } : {}),
+    ...(pageErrorText ? { pageErrorText } : {}),
+  };
+  const classification = classifyChatSurface(classificationInput);
+  const confidence = classification.state === 'idle' && mutationAgeMs < 500 ? 'medium' : classification.confidence;
+
+  const evidence: StateEvidence = {
+    state: classification.state,
+    composerPresent: Boolean(composer),
+    composerEditable,
+    sendControlPresent: Boolean(send && !send.disabled),
     stopControlPresent,
     assistantTurnCount: assistant.length,
     userTurnCount: users.length,
     mutationAgeMs,
-    confidence: state === 'idle' && mutationAgeMs < 500 ? 'medium' : state === 'unknown' ? 'low' : 'high',
+    confidence,
+    selectorProfile: SELECTOR_PROFILE_ID,
+    pageUrl: location.href,
   };
   const latestAssistantText = textOf(assistant.at(-1));
   const latestUserText = textOf(users.at(-1));
   if (latestAssistantText) evidence.latestAssistantText = latestAssistantText;
   if (latestUserText) evidence.latestUserText = latestUserText;
+  if (classification.blockerKind) evidence.blockerKind = classification.blockerKind;
+  if (classification.blockerText) evidence.visibleError = classification.blockerText;
   return evidence;
 }
 
@@ -146,19 +262,24 @@ function setComposerText(prompt: string): boolean {
 
 async function sendPrompt(prompt: string, promptHash?: string, baselineUserTurnCount?: number): Promise<ContentResult> {
   const evidence = inspectState();
-  if (evidence.state !== 'idle') return { ok: false, error: `Chat is not send-safe: ${evidence.state}.`, evidence };
+  if (evidence.state !== 'idle') return { ok: false, error: describeUnsafeState(evidence), evidence };
   if (!setComposerText(prompt)) return { ok: false, error: 'Composer not found or text insertion was not acknowledged.', evidence };
 
   const baseline = baselineUserTurnCount ?? evidence.userTurnCount;
   const expectedHash = promptHash ?? (await hashText(prompt));
   await sleep(120);
 
+  const preSubmitEvidence = inspectState();
+  if (preSubmitEvidence.state !== 'idle') {
+    return { ok: false, error: `Chat became unsafe before submit: ${describeUnsafeState(preSubmitEvidence)}`, evidence: preSubmitEvidence };
+  }
+
   const send = firstElement<HTMLButtonElement>(SELECTORS.send);
   if (send && !send.disabled) {
     send.click();
   } else {
     const editor = firstElement<HTMLElement>(SELECTORS.composer);
-    if (!editor) return { ok: false, error: 'Composer disappeared before submit.' };
+    if (!editor) return { ok: false, error: 'Composer disappeared before submit.', evidence: preSubmitEvidence };
     editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
   }
 
@@ -174,7 +295,16 @@ async function sendPrompt(prompt: string, promptHash?: string, baselineUserTurnC
   return result;
 }
 
+function describeUnsafeState(evidence: StateEvidence): string {
+  const detail = evidence.visibleError ? `: ${evidence.visibleError}` : '';
+  return `Chat is not send-safe: ${evidence.state}${detail}.`;
+}
+
 async function verifyPrompt(promptHash: string, baselineUserTurnCount: number): Promise<ContentResult> {
+  const evidence = inspectState();
+  if (evidence.state === 'logged_out' || evidence.state === 'rate_limited' || evidence.state === 'verification_required' || evidence.state === 'blocked') {
+    return { ok: false, error: describeUnsafeState(evidence), evidence };
+  }
   const presence = await findPromptPresence(promptHash, baselineUserTurnCount);
   const result: ContentResult = {
     ok: true,
@@ -213,11 +343,13 @@ async function findPromptPresence(promptHash: string, baselineUserTurnCount: num
 }
 
 function captureLatest(): ContentResult {
+  const evidence = inspectState();
+  if (evidence.state !== 'idle') return { ok: false, error: describeUnsafeState(evidence), evidence };
   const messages = allElements<HTMLElement>(SELECTORS.assistantMessage);
   const latest = messages.at(-1);
   const text = textOf(latest);
-  if (!text) return { ok: false, error: 'Assistant response not found.' };
-  return { ok: true, text };
+  if (!text) return { ok: false, error: 'Assistant response not found.', evidence };
+  return { ok: true, text, evidence };
 }
 
 async function handleCommand(command: ContentCommand): Promise<ContentResult> {
