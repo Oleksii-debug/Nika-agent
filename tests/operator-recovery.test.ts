@@ -18,7 +18,7 @@ beforeEach(async () => {
 });
 
 describe('operator recovery', () => {
-  it('does not permit releasing an ambiguous external send', async () => {
+  it('does not expose or permit releasing/cancelling an ambiguous external send', async () => {
     await putJob('job-1');
     await putIntent('intent-1', 'job-1', 'ambiguous');
     await db.targetClaims.put({
@@ -28,7 +28,9 @@ describe('operator recovery', () => {
     const [recovery] = await listRecoveryCases();
     expect(recovery.blockers.length).toBeGreaterThan(0);
     expect(recovery.allowedActions).not.toContain('release_if_safe');
+    expect(recovery.allowedActions).not.toContain('cancel');
     await expect(recoverSubject('job', 'job-1', 'release_if_safe')).rejects.toThrow('RECOVERY_UNSAFE_RELEASE');
+    await expect(recoverSubject('job', 'job-1', 'cancel')).rejects.toThrow('RECOVERY_UNSAFE_CANCEL');
     expect(await db.targetClaims.get('https://chatgpt.com/c/abc')).toBeTruthy();
   });
 
@@ -52,7 +54,10 @@ describe('operator recovery', () => {
     });
 
     await recoverSubject('job', 'job-3', 'mark_absent_retry');
-    expect((await db.jobs.get('job-3'))?.state).toBe('pending');
+    const recovered = await db.jobs.get('job-3');
+    expect(recovered?.state).toBe('pending');
+    expect(recovered?.leaseOwner).toBeUndefined();
+    expect(recovered?.leaseUntil).toBeUndefined();
     expect(await db.targetClaims.get('https://chatgpt.com/c/absent')).toBeUndefined();
   });
 
