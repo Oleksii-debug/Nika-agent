@@ -49,11 +49,8 @@ export interface ExecutionLog {
   detail?: string;
 }
 
-export type ContentCommand =
-  | { type: 'status' }
-  | { type: 'send'; prompt: string }
-  | { type: 'captureLatest' };
-
-export type ContentResult =
-  | { ok: true; state?: 'generating' | 'idle'; text?: string }
-  | { ok: false; error: string };
+export type {
+  ActionResultV1 as ContentResult,
+  BrowserCommandV1 as ContentCommand,
+  RuntimeHealthV1,
+} from './protocol';
