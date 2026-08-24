@@ -60,9 +60,12 @@ export type ChatState =
   | 'blocked'
   | 'logged_out'
   | 'rate_limited'
+  | 'verification_required'
   | 'navigation_pending'
   | 'unsupported'
   | 'unknown';
+
+export type ChatBlockerKind = 'login' | 'rate_limit' | 'verification' | 'access' | 'page_error';
 
 export type StateEvidence = {
   state: ChatState;
@@ -76,6 +79,9 @@ export type StateEvidence = {
   latestUserText?: string;
   mutationAgeMs?: number;
   visibleError?: string;
+  blockerKind?: ChatBlockerKind;
+  selectorProfile?: string;
+  pageUrl?: string;
   confidence: 'high' | 'medium' | 'low';
 };
 
