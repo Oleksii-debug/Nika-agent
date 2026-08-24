@@ -1,5 +1,6 @@
 import 'fake-indexeddb/auto';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { fakeBrowser } from 'wxt/testing/fake-browser';
 import { db } from '../src/db';
 import {
   clearAgentQuarantine,
@@ -7,7 +8,22 @@ import {
   quarantineAgent,
   quarantineDisposition,
 } from '../src/chat-quarantine';
-import type { StateEvidence } from '../src/types';
+import type { ChatAgent, StateEvidence } from '../src/types';
+
+function agent(id: string, url: string): ChatAgent {
+  return {
+    id,
+    projectId: 'default',
+    name: id,
+    role: 'developer',
+    url,
+    enabled: true,
+    defaultPrompt: 'Continue',
+    schedule: { kind: 'manual', enabled: true },
+    completion: { waitForIdle: true, timeoutMs: 60_000, settleMs: 2_500 },
+    tags: [],
+  };
+}
 
 function evidence(blockerKind: NonNullable<StateEvidence['blockerKind']>, state: StateEvidence['state']): StateEvidence {
   return {
@@ -27,6 +43,7 @@ function evidence(blockerKind: NonNullable<StateEvidence['blockerKind']>, state:
 
 describe('durable chat quarantine', () => {
   beforeEach(async () => {
+    fakeBrowser.reset();
     await db.agentQuarantines.clear();
   });
 
@@ -61,5 +78,31 @@ describe('durable chat quarantine', () => {
     expect(await getActiveAgentQuarantine('agent-rate', new Date('2026-08-24T08:59:59.000Z'))).toBeDefined();
     expect(await getActiveAgentQuarantine('agent-rate', new Date('2026-08-24T09:00:00.000Z'))).toBeUndefined();
     expect(await db.agentQuarantines.get('agent-rate')).toBeUndefined();
+  });
+
+  it('projects one physical target quarantine across URL aliases and clears them together', async () => {
+    await chrome.storage.local.set({
+      'nika.agents': [
+        agent('agent-a', 'https://chatgpt.com/c/shared'),
+        agent('agent-b', 'https://chatgpt.com/c/shared/?model=gpt-5#latest'),
+        agent('agent-c', 'https://chatgpt.com/c/other'),
+      ],
+    });
+
+    await quarantineAgent('agent-a', evidence('verification', 'verification_required'));
+
+    expect(await getActiveAgentQuarantine('agent-b')).toMatchObject({
+      agentId: 'agent-b',
+      blockerKind: 'verification',
+      mode: 'manual',
+    });
+    expect(await getActiveAgentQuarantine('agent-c')).toBeUndefined();
+    expect(await db.agentQuarantines.get('agent-a')).toBeDefined();
+    expect(await db.agentQuarantines.get('agent-b')).toBeDefined();
+
+    await clearAgentQuarantine('agent-b');
+    expect(await getActiveAgentQuarantine('agent-a')).toBeUndefined();
+    expect(await db.agentQuarantines.get('agent-a')).toBeUndefined();
+    expect(await db.agentQuarantines.get('agent-b')).toBeUndefined();
   });
 });
