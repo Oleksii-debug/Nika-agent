@@ -7,14 +7,11 @@ const SAFETY_WAKE_MINUTES = 1;
 export async function synchronizeSchedules(agents: ChatAgent[], now = new Date()): Promise<void> {
   const enabledIds = new Set(agents.filter((agent) => agent.enabled && agent.schedule.enabled).map((agent) => agent.id));
   const cursors = await db.scheduleCursors.toArray();
-  for (const cursor of cursors) {
-    if (!enabledIds.has(cursor.agentId)) await db.scheduleCursors.delete(cursor.agentId);
-  }
+  for (const cursor of cursors) if (!enabledIds.has(cursor.agentId)) await db.scheduleCursors.delete(cursor.agentId);
 
   for (const agent of agents) {
     if (!agent.enabled || !agent.schedule.enabled || agent.schedule.kind === 'manual') continue;
-    const existing = await db.scheduleCursors.get(agent.id);
-    if (existing) continue;
+    if (await db.scheduleCursors.get(agent.id)) continue;
     const nextDueAt = initialDueAt(agent, now);
     if (nextDueAt) await db.scheduleCursors.put({ agentId: agent.id, nextDueAt, updatedAt: now.toISOString() });
   }
@@ -26,7 +23,6 @@ export async function rebuildWakeAlarm(): Promise<void> {
     .map((cursor) => cursor.nextDueAt ? Date.parse(cursor.nextDueAt) : Number.POSITIVE_INFINITY)
     .filter(Number.isFinite)
     .sort((a, b) => a - b)[0];
-
   await chrome.alarms.clear('nika.scheduler');
   const when = Number.isFinite(next) ? Math.max(Date.now() + 1000, next) : Date.now() + SAFETY_WAKE_MINUTES * 60_000;
   await chrome.alarms.create('nika.scheduler', { when });
@@ -45,7 +41,6 @@ export async function reconcileSchedules(agents: ChatAgent[], now = new Date()):
     if (!agent || !agent.enabled || !agent.schedule.enabled || !cursor.nextDueAt) continue;
     const due = Date.parse(cursor.nextDueAt);
     if (!Number.isFinite(due) || due > now.getTime()) continue;
-
     const occurrenceAt = latestOccurrenceAt(agent, due, now.getTime());
     const occurrenceKey = `${agent.id}:${new Date(occurrenceAt).toISOString()}`;
     if (!(await db.jobs.where('occurrenceKey').equals(occurrenceKey).first())) {
@@ -58,7 +53,6 @@ export async function reconcileSchedules(agents: ChatAgent[], now = new Date()):
       await db.jobs.add(job);
       materialized.push(job);
     }
-
     const next = nextOccurrenceAfter(agent, occurrenceAt, now.getTime());
     await db.scheduleCursors.put({
       agentId: agent.id,
@@ -67,7 +61,6 @@ export async function reconcileSchedules(agents: ChatAgent[], now = new Date()):
       updatedAt: now.toISOString(),
     });
   }
-
   await rebuildWakeAlarm();
   return materialized;
 }
@@ -90,21 +83,37 @@ export async function claimNextDueJob(now = new Date()): Promise<DurableJob | un
       .sortBy('dueAt');
     const job = candidates[0];
     if (!job) return undefined;
-
     const activeForAgent = await db.jobs.where('agentId').equals(job.agentId).filter((candidate) =>
-      candidate.id !== job.id && (candidate.state === 'claimed' || candidate.state === 'running') &&
-      !!candidate.leaseUntil && Date.parse(candidate.leaseUntil) > now.getTime(),
+      candidate.id !== job.id && (candidate.state === 'claimed' || candidate.state === 'running' || candidate.state === 'reconciling') &&
+      (!candidate.leaseUntil || Date.parse(candidate.leaseUntil) > now.getTime()),
     ).first();
     if (activeForAgent) return undefined;
-
     const leaseUntil = new Date(now.getTime() + LEASE_MS).toISOString();
     await db.jobs.update(job.id, { state: 'claimed', leaseOwner: worker, leaseUntil, updatedAt: now.toISOString() });
     return { ...job, state: 'claimed', leaseOwner: worker, leaseUntil, updatedAt: now.toISOString() };
   });
 }
 
+export async function getReconcilingJobs(): Promise<DurableJob[]> {
+  return db.jobs.where('state').equals('reconciling').toArray();
+}
+
 export async function markJobRunning(job: DurableJob, runId: string): Promise<void> {
   await db.jobs.update(job.id, { state: 'running', runId, updatedAt: new Date().toISOString() });
+}
+
+export async function markJobPending(jobId: string, detail?: string): Promise<void> {
+  await db.jobs.update(jobId, {
+    state: 'pending', leaseOwner: undefined, leaseUntil: undefined,
+    lastError: detail, updatedAt: new Date().toISOString(),
+  });
+}
+
+export async function markJobNeedsReview(jobId: string, detail: string): Promise<void> {
+  await db.jobs.update(jobId, {
+    state: 'needs_review', leaseOwner: undefined, leaseUntil: undefined,
+    lastError: detail, updatedAt: new Date().toISOString(),
+  });
 }
 
 export async function markJobSucceeded(jobId: string): Promise<void> {
@@ -124,9 +133,11 @@ async function reclaimExpiredLeases(now: Date): Promise<void> {
   ).toArray();
   for (const job of leased) {
     await db.jobs.update(job.id, {
-      state: job.state === 'running' ? 'needs_review' : 'pending', leaseOwner: undefined, leaseUntil: undefined,
+      state: job.state === 'running' ? 'reconciling' : 'pending',
+      leaseOwner: undefined,
+      leaseUntil: undefined,
       updatedAt: now.toISOString(),
-      lastError: job.state === 'running' ? 'Worker lease expired after execution started; external effect may be ambiguous.' : job.lastError,
+      lastError: job.state === 'running' ? 'Worker lease expired after execution started; reconciling persisted send intent before retry.' : job.lastError,
     });
   }
 }
