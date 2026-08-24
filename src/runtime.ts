@@ -6,6 +6,18 @@ import { getOrCreateSendIntent, setSendIntentState } from './send-intents';
 const agentQueues = new Map<string, Promise<void>>();
 const HARD_BLOCKED_STATES = new Set<ChatState>(['blocked', 'logged_out', 'rate_limited', 'verification_required', 'unsupported']);
 
+export class ChatSurfaceBlockedError extends Error {
+  readonly agentId: string;
+  readonly evidence: StateEvidence;
+
+  constructor(agentId: string, evidence: StateEvidence) {
+    super(describeUnsafeEvidence(evidence));
+    this.name = 'ChatSurfaceBlockedError';
+    this.agentId = agentId;
+    this.evidence = evidence;
+  }
+}
+
 export type RuntimeExecutionContext = {
   runId?: string;
   workflowId?: string;
@@ -47,11 +59,11 @@ export async function sendToAgent(
 ): Promise<void> {
   return runAgentExclusive(agent.id, async () => {
     const tabId = await ensureAgentTab(agent);
-    if (agent.completion.waitForIdle) await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs);
+    if (agent.completion.waitForIdle) await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs, agent.id);
 
     const status = await contentCommand(tabId, { type: 'status' }, { recover: true });
     if (!status.ok || !status.evidence) throw new Error(status.ok ? 'Chat state evidence is unavailable.' : status.error);
-    if (status.evidence.state !== 'idle') throw new Error(describeUnsafeEvidence(status.evidence));
+    if (status.evidence.state !== 'idle') throw blockedError(agent.id, status.evidence);
 
     const intentInput: Parameters<typeof getOrCreateSendIntent>[0] = {
       agentId: agent.id,
@@ -77,7 +89,10 @@ export async function sendToAgent(
       baselineUserTurnCount: intent.baselineUserTurnCount,
     }, { recover: false });
 
-    if (!result.ok) throw new Error(result.error);
+    if (!result.ok) {
+      if (result.evidence && HARD_BLOCKED_STATES.has(result.evidence.state)) throw blockedError(agent.id, result.evidence);
+      throw new Error(result.error);
+    }
     if (result.sendStatus !== 'confirmed') {
       await setSendIntentState(intent.id, 'ambiguous', result.detail ?? 'DOM submit occurred but user-turn confirmation was not unique.');
       throw new Error('SEND_AMBIGUOUS: prompt submission was not confirmed by a unique new user turn.');
@@ -100,6 +115,7 @@ async function reconcileSendIntentUnlocked(agent: ChatAgent, intent: SendIntent)
     baselineUserTurnCount: intent.baselineUserTurnCount,
   }, { recover: true });
   if (!result.ok || !result.presence) {
+    if (!result.ok && result.evidence && HARD_BLOCKED_STATES.has(result.evidence.state)) throw blockedError(agent.id, result.evidence);
     await setSendIntentState(intent.id, 'ambiguous', result.ok ? 'Prompt presence result missing.' : result.error);
     return 'ambiguous';
   }
@@ -126,7 +142,7 @@ export function isStablyIdle(evidence: StateEvidence, settleMs: number): boolean
 export async function waitForAgentIdle(agent: ChatAgent, timeoutOverride?: number, context: RuntimeExecutionContext = {}): Promise<void> {
   return runAgentExclusive(agent.id, async () => {
     const tabId = await ensureAgentTab(agent);
-    await waitUntilIdle(tabId, timeoutOverride ?? agent.completion.timeoutMs, agent.completion.settleMs);
+    await waitUntilIdle(tabId, timeoutOverride ?? agent.completion.timeoutMs, agent.completion.settleMs, agent.id);
     await appendLog({ agentId: agent.id, ...context, level: 'info', event: 'agent_idle' });
   });
 }
@@ -134,21 +150,27 @@ export async function waitForAgentIdle(agent: ChatAgent, timeoutOverride?: numbe
 export async function captureAgentResponse(agent: ChatAgent, context: RuntimeExecutionContext = {}): Promise<string> {
   return runAgentExclusive(agent.id, async () => {
     const tabId = await ensureAgentTab(agent);
-    await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs);
+    await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs, agent.id);
     const result = await contentCommand(tabId, { type: 'captureLatest' }, { recover: true });
-    if (!result.ok || !result.text) throw new Error(result.ok ? 'Response was empty.' : result.error);
+    if (!result.ok || !result.text) {
+      if (!result.ok && result.evidence && HARD_BLOCKED_STATES.has(result.evidence.state)) throw blockedError(agent.id, result.evidence);
+      throw new Error(result.ok ? 'Response was empty.' : result.error);
+    }
     await appendLog({ agentId: agent.id, ...context, level: 'info', event: 'response_captured', detail: result.text.slice(0, 500) });
     return result.text;
   });
 }
 
-export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: number): Promise<void> {
+export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: number, agentId?: string): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let idleSince: number | null = null;
   while (Date.now() < deadline) {
     const result = await contentCommand(tabId, { type: 'status' }, { recover: true });
     const evidence = result.ok ? result.evidence : undefined;
-    if (evidence && HARD_BLOCKED_STATES.has(evidence.state)) throw new Error(describeUnsafeEvidence(evidence));
+    if (evidence && HARD_BLOCKED_STATES.has(evidence.state)) {
+      if (agentId) throw blockedError(agentId, evidence);
+      throw new Error(describeUnsafeEvidence(evidence));
+    }
     if (result.ok && evidence && isStablyIdle(evidence, settleMs)) {
       idleSince ??= Date.now();
       if (Date.now() - idleSince >= Math.min(1000, settleMs)) return;
@@ -158,6 +180,10 @@ export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: 
     await sleep(1000);
   }
   throw new Error('Timed out waiting for ChatGPT to become stably idle.');
+}
+
+function blockedError(agentId: string, evidence: StateEvidence): ChatSurfaceBlockedError {
+  return new ChatSurfaceBlockedError(agentId, evidence);
 }
 
 function describeUnsafeEvidence(evidence: StateEvidence): string {
@@ -195,7 +221,7 @@ async function waitForTabComplete(tabId: number, timeoutMs: number): Promise<voi
       chrome.tabs.onUpdated.removeListener(listener);
       reject(new Error('Timed out loading ChatGPT tab.'));
     }, timeoutMs);
-    const listener = (updatedId: number, info: chrome.tabs.TabChangeInfo) => {
+    const listener = (updatedId: number, info: { status?: string }) => {
       if (updatedId === tabId && info.status === 'complete') {
         clearTimeout(timer);
         chrome.tabs.onUpdated.removeListener(listener);

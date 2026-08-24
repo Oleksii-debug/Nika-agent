@@ -1,6 +1,7 @@
 import { appendLog, getAgents, getWorkflows } from '../src/storage';
 import { auditAndRepairTargetClaims } from '../src/claim-consistency';
-import { reconcileSendIntent, sendToAgent } from '../src/runtime';
+import { getActiveAgentQuarantine, quarantineAgent } from '../src/chat-quarantine';
+import { ChatSurfaceBlockedError, reconcileSendIntent, sendToAgent } from '../src/runtime';
 import { getSendIntentForJob } from '../src/send-intents';
 import { acquireTargetClaim, releaseTargetClaim, type TargetClaimOwner } from '../src/target-claims';
 import { runWorkflow } from '../src/workflow';
@@ -14,6 +15,7 @@ import {
 } from '../src/workflow-state';
 import {
   claimNextDueJob,
+  deferJobUntil,
   enqueueManualAgent,
   getReconcilingJobs,
   markJobFailed,
@@ -179,18 +181,28 @@ async function reconcileInterruptedSends(agents: Awaited<ReturnType<typeof getAg
       await appendLog({ agentId: agent.id, runId: job.runId, source: job.source as RunSource, level: 'info', event: 'send_reconciled_confirmed', detail: `job:${job.id}` });
       continue;
     }
-    const presence = await reconcileSendIntent(agent, intent);
-    if (presence === 'confirmed') {
-      await markJobSucceeded(job.id);
-      await releaseTargetClaim(agent.id, owner);
-      await appendLog({ agentId: agent.id, runId: job.runId, source: job.source as RunSource, level: 'info', event: 'send_reconciled_confirmed', detail: `job:${job.id}` });
-    } else if (presence === 'absent') {
-      await markJobPending(job.id, 'Persisted intent was absent from post-baseline user turns; safe replay permitted with the same intent.');
-      await releaseTargetClaim(agent.id, owner);
-      await appendLog({ agentId: agent.id, runId: job.runId, source: job.source as RunSource, level: 'warning', event: 'send_reconciled_absent', detail: `job:${job.id}` });
-    } else {
-      await markJobNeedsReview(job.id, 'Interrupted send produced ambiguous DOM evidence; automatic replay blocked.');
-      await appendLog({ agentId: agent.id, runId: job.runId, source: job.source as RunSource, level: 'error', event: 'send_reconciliation_ambiguous', detail: `job:${job.id}` });
+    try {
+      const presence = await reconcileSendIntent(agent, intent);
+      if (presence === 'confirmed') {
+        await markJobSucceeded(job.id);
+        await releaseTargetClaim(agent.id, owner);
+        await appendLog({ agentId: agent.id, runId: job.runId, source: job.source as RunSource, level: 'info', event: 'send_reconciled_confirmed', detail: `job:${job.id}` });
+      } else if (presence === 'absent') {
+        await markJobPending(job.id, 'Persisted intent was absent from post-baseline user turns; safe replay permitted with the same intent.');
+        await releaseTargetClaim(agent.id, owner);
+        await appendLog({ agentId: agent.id, runId: job.runId, source: job.source as RunSource, level: 'warning', event: 'send_reconciled_absent', detail: `job:${job.id}` });
+      } else {
+        await markJobNeedsReview(job.id, 'Interrupted send produced ambiguous DOM evidence; automatic replay blocked.');
+        await appendLog({ agentId: agent.id, runId: job.runId, source: job.source as RunSource, level: 'error', event: 'send_reconciliation_ambiguous', detail: `job:${job.id}` });
+      }
+    } catch (error) {
+      if (error instanceof ChatSurfaceBlockedError) {
+        const quarantine = await quarantineAgent(agent.id, error.evidence);
+        await markJobNeedsReview(job.id, `Send reconciliation paused by ChatGPT surface blocker: ${error.message}`);
+        await appendLog({ agentId: agent.id, runId: job.runId, source: job.source as RunSource, level: 'warning', event: 'agent_quarantined_during_reconciliation', detail: quarantineDetail(quarantine, error.message) });
+        continue;
+      }
+      throw error;
     }
   }
 }
@@ -205,6 +217,15 @@ async function drainJobs(): Promise<void> {
       const agent = (await getAgents()).find((candidate) => candidate.id === job.agentId);
       if (!agent || !agent.enabled) {
         await markJobFailed(job.id, 'Target agent is missing or disabled.');
+        continue;
+      }
+
+      const quarantine = await getActiveAgentQuarantine(agent.id);
+      if (quarantine) {
+        const detail = `Agent quarantined by ${quarantine.blockerKind}${quarantine.detail ? `: ${quarantine.detail}` : ''}`;
+        if (quarantine.mode === 'cooldown' && quarantine.resumeAt) await deferJobUntil(job.id, quarantine.resumeAt, detail);
+        else await markJobNeedsReview(job.id, detail);
+        await appendLog({ agentId: agent.id, source: job.source as RunSource, level: 'warning', event: 'agent_run_suppressed_by_quarantine', detail: quarantineDetail(quarantine, detail) });
         continue;
       }
 
@@ -225,6 +246,20 @@ async function drainJobs(): Promise<void> {
         await appendLog({ agentId: agent.id, ...runtimeContext, level: 'info', event: 'agent_run_completed', detail: `job:${job.id}` });
       } catch (error) {
         const intent = await getSendIntentForJob(job.id);
+        if (error instanceof ChatSurfaceBlockedError) {
+          const quarantineState = await quarantineAgent(agent.id, error.evidence);
+          if (intent && (intent.state === 'dispatching' || intent.state === 'ambiguous')) {
+            await markJobReconciling(job.id, error.message);
+          } else if (quarantineState?.mode === 'cooldown' && quarantineState.resumeAt) {
+            await deferJobUntil(job.id, quarantineState.resumeAt, error.message);
+            await releaseTargetClaim(agent.id, owner);
+          } else {
+            await markJobNeedsReview(job.id, error.message);
+            await releaseTargetClaim(agent.id, owner);
+          }
+          await appendLog({ agentId: agent.id, ...runtimeContext, level: 'warning', event: 'agent_quarantined', detail: quarantineDetail(quarantineState, error.message) });
+          continue;
+        }
         if (intent && (intent.state === 'dispatching' || intent.state === 'ambiguous')) {
           await markJobReconciling(job.id, error instanceof Error ? error.message : String(error));
         } else {
@@ -253,6 +288,12 @@ async function runWorkflowNow(workflowId: string, source: RunSource): Promise<vo
 
 function jobTargetOwner(jobId: string): TargetClaimOwner {
   return { ownerKind: 'job', ownerId: jobId, operationId: `job:${jobId}` };
+}
+
+function quarantineDetail(quarantine: Awaited<ReturnType<typeof quarantineAgent>> | Awaited<ReturnType<typeof getActiveAgentQuarantine>>, fallback: string): string {
+  if (!quarantine) return fallback;
+  const resume = quarantine.resumeAt ? `;resumeAt:${quarantine.resumeAt}` : '';
+  return `${quarantine.blockerKind};mode:${quarantine.mode}${resume};${fallback}`;
 }
 
 function sameChatUrl(a: string, b: string): boolean {

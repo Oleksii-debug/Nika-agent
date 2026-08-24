@@ -1,5 +1,5 @@
 import Dexie, { type Table } from 'dexie';
-import type { WorkflowDefinition } from './types';
+import type { ChatBlockerKind, ChatState, WorkflowDefinition } from './types';
 
 export type DurableJobState =
   | 'pending'
@@ -80,6 +80,20 @@ export type ClaimAuditFinding = {
   resolvedAt?: string;
 };
 
+export type AgentQuarantineMode = 'manual' | 'cooldown';
+
+export type AgentQuarantine = {
+  agentId: string;
+  state: ChatState;
+  blockerKind: ChatBlockerKind;
+  mode: AgentQuarantineMode;
+  resumeAt?: string;
+  detail?: string;
+  pageUrl?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type WorkflowRunState = 'running' | 'completed' | 'failed' | 'needs_review';
 export type WorkflowWaitKind = 'delay' | 'wait_idle' | 'target';
 
@@ -116,6 +130,7 @@ class NikaDatabase extends Dexie {
   sendIntents!: Table<SendIntent, string>;
   targetClaims!: Table<DurableTargetClaim, string>;
   claimAuditFindings!: Table<ClaimAuditFinding, string>;
+  agentQuarantines!: Table<AgentQuarantine, string>;
   workflowRuns!: Table<DurableWorkflowRun, string>;
   workflowOutputs!: Table<WorkflowOutput, string>;
 
@@ -176,6 +191,16 @@ class NikaDatabase extends Dexie {
       sendIntents: '&id,jobId,agentId,runId,state,createdAt,[jobId+state]',
       targetClaims: '&targetKey,ownerKind,ownerId,operationId,updatedAt,[ownerKind+ownerId]',
       claimAuditFindings: '&id,targetKey,state,ownerKind,ownerId,updatedAt,[state+ownerKind]',
+      workflowRuns: '&id,workflowId,workflowRevision,state,updatedAt,wakeAt,[workflowId+state],[state+wakeAt]',
+      workflowOutputs: '&id,[runId+key],runId,key,capturedAt',
+    });
+    this.version(8).stores({
+      jobs: '&id,&occurrenceKey,agentId,state,dueAt,leaseUntil,[state+dueAt]',
+      scheduleCursors: '&agentId,nextDueAt',
+      sendIntents: '&id,jobId,agentId,runId,state,createdAt,[jobId+state]',
+      targetClaims: '&targetKey,ownerKind,ownerId,operationId,updatedAt,[ownerKind+ownerId]',
+      claimAuditFindings: '&id,targetKey,state,ownerKind,ownerId,updatedAt,[state+ownerKind]',
+      agentQuarantines: '&agentId,mode,blockerKind,resumeAt,updatedAt,[mode+blockerKind]',
       workflowRuns: '&id,workflowId,workflowRevision,state,updatedAt,wakeAt,[workflowId+state],[state+wakeAt]',
       workflowOutputs: '&id,[runId+key],runId,key,capturedAt',
     });

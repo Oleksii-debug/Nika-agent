@@ -6,7 +6,7 @@ export const WORKFLOW_WAKE_PREFIX = 'nika.workflow.wake.';
 export async function createWorkflowRun(
   workflow: WorkflowDefinition,
   source: RunSource,
-  runId = crypto.randomUUID(),
+  runId: string = crypto.randomUUID(),
 ): Promise<DurableWorkflowRun> {
   const existing = await db.workflowRuns.get(runId);
   if (existing) return existing;
