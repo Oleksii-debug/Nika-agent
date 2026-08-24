@@ -13,7 +13,7 @@ export async function createWorkflowRun(
 
   const workflowSnapshot = cloneWorkflow(workflow);
   const workflowRevision = await hashWorkflow(workflowSnapshot);
-  const now = new Date().toISOString();
+  const timestamp = new Date().toISOString();
   const run: DurableWorkflowRun = {
     id: runId,
     workflowId: workflow.id,
@@ -22,8 +22,8 @@ export async function createWorkflowRun(
     source,
     state: 'running',
     nextStepIndex: 0,
-    createdAt: now,
-    updatedAt: now,
+    createdAt: timestamp,
+    updatedAt: timestamp,
   };
   await db.workflowRuns.add(run);
   return run;
@@ -43,11 +43,10 @@ export async function checkpointStepStarted(
   resumeAt?: string,
   waitDeadlineAt?: string,
 ): Promise<void> {
-  await db.workflowRuns.update(runId, {
-    currentStepId: stepId,
-    resumeAt,
-    waitDeadlineAt,
-    updatedAt: new Date().toISOString(),
+  await replaceWorkflowRun(runId, (run) => {
+    run.currentStepId = stepId;
+    assignOptional(run, 'resumeAt', resumeAt);
+    assignOptional(run, 'waitDeadlineAt', waitDeadlineAt);
   });
 }
 
@@ -57,22 +56,20 @@ export async function checkpointWorkflowWait(
   wakeAt: string,
   waitDeadlineAt?: string,
 ): Promise<void> {
-  await db.workflowRuns.update(runId, {
-    waitKind,
-    wakeAt,
-    waitDeadlineAt,
-    updatedAt: new Date().toISOString(),
+  await replaceWorkflowRun(runId, (run) => {
+    run.waitKind = waitKind;
+    run.wakeAt = wakeAt;
+    assignOptional(run, 'waitDeadlineAt', waitDeadlineAt);
   });
   await ensureWorkflowWakeAlarm(runId, wakeAt);
 }
 
 export async function clearWorkflowWait(runId: string): Promise<void> {
   await chrome.alarms.clear(workflowWakeAlarmName(runId));
-  await db.workflowRuns.update(runId, {
-    wakeAt: undefined,
-    waitKind: undefined,
-    waitDeadlineAt: undefined,
-    updatedAt: new Date().toISOString(),
+  await replaceWorkflowRun(runId, (run) => {
+    delete run.wakeAt;
+    delete run.waitKind;
+    delete run.waitDeadlineAt;
   });
 }
 
@@ -92,42 +89,39 @@ export function workflowRunIdFromAlarm(name: string): string | undefined {
 
 export async function checkpointStepCompleted(runId: string, nextStepIndex: number): Promise<void> {
   await chrome.alarms.clear(workflowWakeAlarmName(runId));
-  await db.workflowRuns.update(runId, {
-    nextStepIndex,
-    currentStepId: undefined,
-    resumeAt: undefined,
-    wakeAt: undefined,
-    waitKind: undefined,
-    waitDeadlineAt: undefined,
-    lastError: undefined,
-    updatedAt: new Date().toISOString(),
+  await replaceWorkflowRun(runId, (run) => {
+    run.nextStepIndex = nextStepIndex;
+    delete run.currentStepId;
+    delete run.resumeAt;
+    delete run.wakeAt;
+    delete run.waitKind;
+    delete run.waitDeadlineAt;
+    delete run.lastError;
   });
 }
 
 export async function completeWorkflowRun(runId: string): Promise<void> {
-  const now = new Date().toISOString();
+  const completedAt = new Date().toISOString();
   await chrome.alarms.clear(workflowWakeAlarmName(runId));
-  await db.workflowRuns.update(runId, {
-    state: 'completed',
-    completedAt: now,
-    currentStepId: undefined,
-    resumeAt: undefined,
-    wakeAt: undefined,
-    waitKind: undefined,
-    waitDeadlineAt: undefined,
-    updatedAt: now,
-  });
+  await replaceWorkflowRun(runId, (run) => {
+    run.state = 'completed';
+    run.completedAt = completedAt;
+    delete run.currentStepId;
+    delete run.resumeAt;
+    delete run.wakeAt;
+    delete run.waitKind;
+    delete run.waitDeadlineAt;
+  }, completedAt);
 }
 
 export async function failWorkflowRun(runId: string, error: unknown, needsReview = false): Promise<void> {
   await chrome.alarms.clear(workflowWakeAlarmName(runId));
-  await db.workflowRuns.update(runId, {
-    state: needsReview ? 'needs_review' : 'failed',
-    wakeAt: undefined,
-    waitKind: undefined,
-    waitDeadlineAt: undefined,
-    lastError: error instanceof Error ? error.message : String(error),
-    updatedAt: new Date().toISOString(),
+  await replaceWorkflowRun(runId, (run) => {
+    run.state = needsReview ? 'needs_review' : 'failed';
+    delete run.wakeAt;
+    delete run.waitKind;
+    delete run.waitDeadlineAt;
+    run.lastError = error instanceof Error ? error.message : String(error);
   });
 }
 
@@ -150,6 +144,27 @@ export async function hashWorkflow(workflow: WorkflowDefinition): Promise<string
   const canonical = canonicalize(workflow);
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function replaceWorkflowRun(
+  runId: string,
+  mutate: (run: DurableWorkflowRun) => void,
+  updatedAt = new Date().toISOString(),
+): Promise<void> {
+  const run = await db.workflowRuns.get(runId);
+  if (!run) throw new Error(`WORKFLOW_RUN_MISSING: ${runId}`);
+  mutate(run);
+  run.updatedAt = updatedAt;
+  await db.workflowRuns.put(run);
+}
+
+function assignOptional<K extends 'resumeAt' | 'waitDeadlineAt'>(
+  run: DurableWorkflowRun,
+  key: K,
+  value: string | undefined,
+): void {
+  if (value === undefined) delete run[key];
+  else run[key] = value;
 }
 
 function cloneWorkflow(workflow: WorkflowDefinition): WorkflowDefinition {
