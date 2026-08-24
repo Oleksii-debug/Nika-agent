@@ -1,6 +1,7 @@
 import { appendLog, getAgents, getWorkflows } from '../src/storage';
 import { reconcileSendIntent, sendToAgent } from '../src/runtime';
 import { getSendIntentForJob } from '../src/send-intents';
+import { acquireTargetClaim, releaseTargetClaim, type TargetClaimOwner } from '../src/target-claims';
 import { runWorkflow } from '../src/workflow';
 import {
   ensureWorkflowWakeAlarm,
@@ -153,22 +154,29 @@ async function reconcileInterruptedSends(agents: Awaited<ReturnType<typeof getAg
       await markJobNeedsReview(job.id, 'Cannot reconcile interrupted send because target agent is missing or disabled.');
       continue;
     }
+    const owner = jobTargetOwner(job.id);
+    if (!(await acquireTargetClaim(agent.id, owner))) continue;
+
     const intent = await getSendIntentForJob(job.id);
     if (!intent) {
       await markJobPending(job.id, 'No persisted send intent exists; execution stopped before the irreversible send phase.');
+      await releaseTargetClaim(agent.id, owner);
       continue;
     }
     if (intent.state === 'confirmed') {
       await markJobSucceeded(job.id);
+      await releaseTargetClaim(agent.id, owner);
       await appendLog({ agentId: agent.id, runId: job.runId, source: job.source as RunSource, level: 'info', event: 'send_reconciled_confirmed', detail: `job:${job.id}` });
       continue;
     }
     const presence = await reconcileSendIntent(agent, intent);
     if (presence === 'confirmed') {
       await markJobSucceeded(job.id);
+      await releaseTargetClaim(agent.id, owner);
       await appendLog({ agentId: agent.id, runId: job.runId, source: job.source as RunSource, level: 'info', event: 'send_reconciled_confirmed', detail: `job:${job.id}` });
     } else if (presence === 'absent') {
       await markJobPending(job.id, 'Persisted intent was absent from post-baseline user turns; safe replay permitted with the same intent.');
+      await releaseTargetClaim(agent.id, owner);
       await appendLog({ agentId: agent.id, runId: job.runId, source: job.source as RunSource, level: 'warning', event: 'send_reconciled_absent', detail: `job:${job.id}` });
     } else {
       await markJobNeedsReview(job.id, 'Interrupted send produced ambiguous DOM evidence; automatic replay blocked.');
@@ -189,6 +197,13 @@ async function drainJobs(): Promise<void> {
         await markJobFailed(job.id, 'Target agent is missing or disabled.');
         continue;
       }
+
+      const owner = jobTargetOwner(job.id);
+      if (!(await acquireTargetClaim(agent.id, owner))) {
+        await markJobPending(job.id, 'Target is durably owned by another mutating operation; retry deferred.');
+        break;
+      }
+
       const runId = job.runId ?? crypto.randomUUID();
       await markJobRunning(job, runId);
       const runtimeContext = { runId, source: job.source as RunSource, jobId: job.id } as const;
@@ -196,6 +211,7 @@ async function drainJobs(): Promise<void> {
       try {
         await sendToAgent(agent, job.prompt?.trim() || agent.defaultPrompt, runtimeContext);
         await markJobSucceeded(job.id);
+        await releaseTargetClaim(agent.id, owner);
         await appendLog({ agentId: agent.id, ...runtimeContext, level: 'info', event: 'agent_run_completed', detail: `job:${job.id}` });
       } catch (error) {
         const intent = await getSendIntentForJob(job.id);
@@ -203,6 +219,7 @@ async function drainJobs(): Promise<void> {
           await markJobReconciling(job.id, error instanceof Error ? error.message : String(error));
         } else {
           await markJobFailed(job.id, error);
+          await releaseTargetClaim(agent.id, owner);
         }
         await appendLog({ agentId: agent.id, ...runtimeContext, level: 'error', event: job.source === 'scheduled' ? 'scheduled_run_failed' : 'manual_run_failed', detail: error instanceof Error ? error.message : String(error) });
       }
@@ -222,6 +239,10 @@ async function runWorkflowNow(workflowId: string, source: RunSource): Promise<vo
   const workflow = (await getWorkflows()).find((candidate) => candidate.id === workflowId);
   if (!workflow || !workflow.enabled) return;
   await runWorkflow(workflow, { runId: crypto.randomUUID(), source });
+}
+
+function jobTargetOwner(jobId: string): TargetClaimOwner {
+  return { ownerKind: 'job', ownerId: jobId, operationId: `job:${jobId}` };
 }
 
 function sameChatUrl(a: string, b: string): boolean {
