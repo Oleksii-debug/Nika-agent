@@ -52,13 +52,14 @@ export async function sendToAgent(
     if (!status.ok || !status.evidence) throw new Error(status.ok ? 'Chat state evidence is unavailable.' : status.error);
     if (status.evidence.state !== 'idle') throw new Error(`Chat is not send-safe: ${status.evidence.state}.`);
 
-    const intent = await getOrCreateSendIntent({
-      jobId: context.jobId,
+    const intentInput: Parameters<typeof getOrCreateSendIntent>[0] = {
       agentId: agent.id,
-      runId: context.runId,
       prompt,
       baselineUserTurnCount: status.evidence.userTurnCount,
-    });
+    };
+    if (context.jobId !== undefined) intentInput.jobId = context.jobId;
+    if (context.runId !== undefined) intentInput.runId = context.runId;
+    const intent = await getOrCreateSendIntent(intentInput);
 
     if (intent.state === 'confirmed') return;
     if (intent.state === 'dispatching' || intent.state === 'ambiguous') {
