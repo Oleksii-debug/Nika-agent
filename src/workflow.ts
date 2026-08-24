@@ -1,5 +1,5 @@
 import { appendLog, getAgents, getWorkflows } from './storage';
-import { acquireAgentLease, getRecoverableRuns, getRun, putRun, releaseAgentLease, updateRun } from './db';
+import { acquireAgentLease, getRecoverableRuns, getRun, putRun, releaseAgentLease, startLeaseHeartbeat, updateRun } from './db';
 import { captureAgentResponse, sendToAgent, waitForAgentIdle } from './runtime';
 import type { AgentLease, ChatAgent, RunRecord, WorkflowDefinition, WorkflowStep } from './types';
 
@@ -61,6 +61,8 @@ async function executeRun(workflow: WorkflowDefinition, initialRun: RunRecord): 
   const byId = new Map(agents.map((agent) => [agent.id, agent]));
   const context = new Map(Object.entries(initialRun.context));
   const leases: AgentLease[] = [];
+  let leaseLost: AgentLease | undefined;
+  let stopHeartbeat: (() => void) | undefined;
 
   try {
     for (const agentId of workflowAgentIds(workflow)) {
@@ -68,8 +70,12 @@ async function executeRun(workflow: WorkflowDefinition, initialRun: RunRecord): 
       if (!lease) throw new Error(`Agent '${agentId}' is already executing another run.`);
       leases.push(lease);
     }
+    stopHeartbeat = startLeaseHeartbeat(leases, (lease) => {
+      leaseLost ??= lease;
+    });
 
     for (let index = initialRun.currentStepIndex; index < workflow.steps.length; index += 1) {
+      assertLeaseHealth(leaseLost);
       const step = workflow.steps[index];
       const meta = { runId: initialRun.runId, stepId: step.id, correlationId: initialRun.correlationId };
       const targetChatId = 'agentId' in step ? step.agentId : undefined;
@@ -123,6 +129,7 @@ async function executeRun(workflow: WorkflowDefinition, initialRun: RunRecord): 
         }
       }
 
+      assertLeaseHealth(leaseLost);
       await updateRun(initialRun.runId, {
         context: Object.fromEntries(context),
         currentStepIndex: index + 1,
@@ -152,6 +159,7 @@ async function executeRun(workflow: WorkflowDefinition, initialRun: RunRecord): 
     });
     throw error;
   } finally {
+    stopHeartbeat?.();
     await Promise.allSettled(leases.map((lease) => releaseAgentLease(lease)));
   }
 }
@@ -169,6 +177,10 @@ async function markAmbiguousSideEffect(run: RunRecord, step: WorkflowStep): Prom
     event: 'workflow_side_effect_ambiguous',
     detail: message,
   });
+}
+
+function assertLeaseHealth(leaseLost: AgentLease | undefined): void {
+  if (leaseLost) throw new Error(`Execution lease for agent '${leaseLost.agentId}' was lost.`);
 }
 
 function workflowAgentIds(workflow: WorkflowDefinition): string[] {
