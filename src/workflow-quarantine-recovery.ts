@@ -7,7 +7,15 @@ export async function listQuarantineWorkflowWaiters(agentId: string): Promise<Du
 
 export function quarantineWorkflowWaitsOnAgent(run: DurableWorkflowRun, agentId: string): boolean {
   if (run.state !== 'running' || run.waitKind !== 'quarantine' || !run.currentStepId) return false;
-  const step = run.workflowSnapshot.steps[run.nextStepIndex];
-  if (!step || step.id !== run.currentStepId || step.type === 'delay') return false;
-  return step.agentId === agentId;
+  const step = run.workflowSnapshot?.steps[run.nextStepIndex];
+  if (!step || step.id !== run.currentStepId) return false;
+  switch (step.type) {
+    case 'send':
+    case 'wait_idle':
+    case 'capture':
+    case 'forward':
+      return step.agentId === agentId;
+    case 'delay':
+      return false;
+  }
 }
