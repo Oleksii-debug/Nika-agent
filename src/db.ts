@@ -35,12 +35,7 @@ export type ScheduleCursor = {
   updatedAt: string;
 };
 
-export type SendIntentState =
-  | 'persisted'
-  | 'dispatching'
-  | 'confirmed'
-  | 'absent'
-  | 'ambiguous';
+export type SendIntentState = 'persisted' | 'dispatching' | 'confirmed' | 'absent' | 'ambiguous';
 
 export type SendIntent = {
   id: string;
@@ -57,10 +52,36 @@ export type SendIntent = {
   detail?: string;
 };
 
+export type WorkflowRunState = 'running' | 'completed' | 'failed' | 'needs_review';
+
+export type DurableWorkflowRun = {
+  id: string;
+  workflowId: string;
+  source: 'manual' | 'scheduled' | 'workflow';
+  state: WorkflowRunState;
+  nextStepIndex: number;
+  currentStepId?: string;
+  resumeAt?: string;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+};
+
+export type WorkflowOutput = {
+  id: string;
+  runId: string;
+  key: string;
+  value: string;
+  capturedAt: string;
+};
+
 class NikaDatabase extends Dexie {
   jobs!: Table<DurableJob, string>;
   scheduleCursors!: Table<ScheduleCursor, string>;
   sendIntents!: Table<SendIntent, string>;
+  workflowRuns!: Table<DurableWorkflowRun, string>;
+  workflowOutputs!: Table<WorkflowOutput, string>;
 
   constructor() {
     super('nika-agent');
@@ -72,6 +93,13 @@ class NikaDatabase extends Dexie {
       jobs: '&id,&occurrenceKey,agentId,state,dueAt,leaseUntil,[state+dueAt]',
       scheduleCursors: '&agentId,nextDueAt',
       sendIntents: '&id,jobId,agentId,runId,state,createdAt,[jobId+state]',
+    });
+    this.version(3).stores({
+      jobs: '&id,&occurrenceKey,agentId,state,dueAt,leaseUntil,[state+dueAt]',
+      scheduleCursors: '&agentId,nextDueAt',
+      sendIntents: '&id,jobId,agentId,runId,state,createdAt,[jobId+state]',
+      workflowRuns: '&id,workflowId,state,updatedAt,[workflowId+state]',
+      workflowOutputs: '&id,[runId+key],runId,key,capturedAt',
     });
   }
 }
