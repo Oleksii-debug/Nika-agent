@@ -40,21 +40,21 @@ export interface WorkflowDefinition {
 }
 
 export interface ExecutionContext {
-  runId?: string;
-  stepId?: string;
-  workflowId?: string;
+  runId?: string | undefined;
+  stepId?: string | undefined;
+  workflowId?: string | undefined;
 }
 
 export interface ExecutionLog {
   id: string;
   timestamp: string;
-  agentId?: string;
-  workflowId?: string;
-  runId?: string;
-  stepId?: string;
+  agentId?: string | undefined;
+  workflowId?: string | undefined;
+  runId?: string | undefined;
+  stepId?: string | undefined;
   level: 'info' | 'warning' | 'error';
   event: string;
-  detail?: string;
+  detail?: string | undefined;
 }
 
 export type ContentCommand =
