@@ -1,5 +1,6 @@
+import { getActiveAgentQuarantine, quarantineAgent } from './chat-quarantine';
 import { appendLog, getAgents } from './storage';
-import { captureAgentResponse, inspectAgentState, isStablyIdle, sendToAgent } from './runtime';
+import { captureAgentResponse, ChatSurfaceBlockedError, inspectAgentState, isStablyIdle, sendToAgent } from './runtime';
 import { getSendIntentForJob } from './send-intents';
 import { acquireTargetClaim, releaseTargetClaim, type TargetClaimOwner } from './target-claims';
 import {
@@ -15,7 +16,8 @@ import {
   putWorkflowOutput,
   verifyWorkflowSnapshot,
 } from './workflow-state';
-import type { ChatAgent, RunSource, WorkflowDefinition } from './types';
+import type { AgentQuarantine } from './db';
+import type { ChatAgent, RunSource, StateEvidence, WorkflowDefinition } from './types';
 
 const WAIT_IDLE_POLL_MS = 2_000;
 const TARGET_RETRY_MS = 5_000;
@@ -87,6 +89,7 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
       switch (step.type) {
         case 'send': {
           const agent = requireAgent(byId, step.agentId);
+          if (await suspendForExistingQuarantine(runId, agent, runtimeContext)) return 'suspended';
           const sendKey = workflowSendKey(runId, step.id);
           const owner = workflowTargetOwner(runId, step.id);
           if (!(await acquireTargetClaim(agent.id, owner))) {
@@ -101,16 +104,19 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
             await releaseTargetClaim(agent.id, owner);
           } catch (error) {
             await releaseWorkflowClaimIfSafe(agent.id, owner, sendKey);
+            if (error instanceof ChatSurfaceBlockedError && await suspendForBlockedEvidence(runId, agent, error.evidence, runtimeContext)) return 'suspended';
             throw error;
           }
           break;
         }
         case 'wait_idle': {
           const agent = requireAgent(byId, step.agentId);
+          if (await suspendForExistingQuarantine(runId, agent, runtimeContext)) return 'suspended';
           const deadline = waitDeadlineAt ? Date.parse(waitDeadlineAt) : Date.now() + Math.max(1_000, step.timeoutMs);
           if (!Number.isFinite(deadline)) throw new Error('WORKFLOW_WAIT_INVALID: persisted wait_idle deadline is invalid.');
 
           const evidence = await inspectAgentState(agent);
+          if (await suspendForBlockedEvidence(runId, agent, evidence, runtimeContext)) return 'suspended';
           if (isStablyIdle(evidence, agent.completion.settleMs)) {
             await clearWorkflowWait(runId);
             await appendLog({ agentId: agent.id, ...runtimeContext, level: 'info', event: 'agent_idle', detail: `state:${evidence.state}` });
@@ -129,16 +135,23 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
         }
         case 'capture': {
           const agent = requireAgent(byId, step.agentId);
+          if (await suspendForExistingQuarantine(runId, agent, runtimeContext)) return 'suspended';
           const existing = context.get(step.outputKey);
           if (!existing) {
-            const captured = await captureAgentResponse(agent, runtimeContext);
-            await putWorkflowOutput(runId, step.outputKey, captured);
-            context.set(step.outputKey, captured);
+            try {
+              const captured = await captureAgentResponse(agent, runtimeContext);
+              await putWorkflowOutput(runId, step.outputKey, captured);
+              context.set(step.outputKey, captured);
+            } catch (error) {
+              if (error instanceof ChatSurfaceBlockedError && await suspendForBlockedEvidence(runId, agent, error.evidence, runtimeContext)) return 'suspended';
+              throw error;
+            }
           }
           break;
         }
         case 'forward': {
           const agent = requireAgent(byId, step.agentId);
+          if (await suspendForExistingQuarantine(runId, agent, runtimeContext)) return 'suspended';
           const captured = context.get(step.fromKey);
           if (!captured) throw new Error(`Workflow output '${step.fromKey}' is not available.`);
           const sendKey = workflowSendKey(runId, step.id);
@@ -155,6 +168,7 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
             await releaseTargetClaim(agent.id, owner);
           } catch (error) {
             await releaseWorkflowClaimIfSafe(agent.id, owner, sendKey);
+            if (error instanceof ChatSurfaceBlockedError && await suspendForBlockedEvidence(runId, agent, error.evidence, runtimeContext)) return 'suspended';
             throw error;
           }
           break;
@@ -187,6 +201,41 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
     await appendLog({ workflowId: pinnedWorkflow.id, runId, source: durable.source, level: 'error', event: needsReview ? 'workflow_needs_review' : 'workflow_failed', detail: message });
     throw error;
   }
+}
+
+async function suspendForExistingQuarantine(
+  runId: string,
+  agent: ChatAgent,
+  context: { workflowId: string; runId: string; stepId: string; source: RunSource },
+): Promise<boolean> {
+  const quarantine = await getActiveAgentQuarantine(agent.id);
+  if (!quarantine) return false;
+  await persistWorkflowQuarantineWait(runId, agent, quarantine, context);
+  return true;
+}
+
+async function suspendForBlockedEvidence(
+  runId: string,
+  agent: ChatAgent,
+  evidence: StateEvidence,
+  context: { workflowId: string; runId: string; stepId: string; source: RunSource },
+): Promise<boolean> {
+  const quarantine = await quarantineAgent(agent.id, evidence);
+  if (!quarantine) return false;
+  await persistWorkflowQuarantineWait(runId, agent, quarantine, context);
+  return true;
+}
+
+async function persistWorkflowQuarantineWait(
+  runId: string,
+  agent: ChatAgent,
+  quarantine: AgentQuarantine,
+  context: { workflowId: string; runId: string; stepId: string; source: RunSource },
+): Promise<void> {
+  const wakeAt = quarantine.mode === 'cooldown' ? quarantine.resumeAt : undefined;
+  await checkpointWorkflowWait(runId, 'quarantine', wakeAt);
+  const detail = `blocker:${quarantine.blockerKind};mode:${quarantine.mode}${wakeAt ? `;wakeAt:${wakeAt}` : ''}`;
+  await appendLog({ agentId: agent.id, ...context, level: 'warning', event: 'workflow_quarantine_suspended', detail });
 }
 
 async function releaseWorkflowClaimIfSafe(agentId: string, owner: TargetClaimOwner, sendKey: string): Promise<void> {
