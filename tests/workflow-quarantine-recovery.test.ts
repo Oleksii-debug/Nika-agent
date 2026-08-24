@@ -1,7 +1,12 @@
 import 'fake-indexeddb/auto';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { db, type DurableWorkflowRun } from '../src/db';
-import { listQuarantineWorkflowWaiters, quarantineWorkflowWaitsOnAgent } from '../src/workflow-quarantine-recovery';
+import {
+  listClearedQuarantineWorkflowWaiters,
+  listQuarantineWorkflowWaiters,
+  quarantineWorkflowTargetAgentId,
+  quarantineWorkflowWaitsOnAgent,
+} from '../src/workflow-quarantine-recovery';
 import type { WorkflowDefinition } from '../src/types';
 
 function workflow(id: string, agentId: string): WorkflowDefinition {
@@ -64,6 +69,37 @@ describe('workflow quarantine recovery', () => {
     });
 
     expect(await listQuarantineWorkflowWaiters('agent-a')).toEqual([]);
+    expect(await listClearedQuarantineWorkflowWaiters()).toEqual([]);
+  });
+
+  it('discovers a cleared quarantine wait during ordinary reconciliation without a popup wake', async () => {
+    await db.workflowRuns.put(run({ id: 'restart-recovery' }));
+    await db.agentQuarantines.put({
+      agentId: 'agent-a',
+      state: 'logged_out',
+      blockerKind: 'login',
+      mode: 'manual',
+      createdAt: '2026-08-24T10:00:00.000Z',
+      updatedAt: '2026-08-24T10:00:00.000Z',
+    });
+
+    expect(await listClearedQuarantineWorkflowWaiters()).toEqual([]);
+
+    // Models operator clear followed by MV3 worker loss before nika.quarantineCleared is delivered.
+    await db.agentQuarantines.delete('agent-a');
+
+    expect((await listClearedQuarantineWorkflowWaiters()).map((item) => item.id)).toEqual(['restart-recovery']);
+  });
+
+  it('ordinary reconciliation excludes malformed quarantine checkpoints even after clear', async () => {
+    const mismatch = run({ id: 'mismatch', currentStepId: 'wait-1' });
+    const missing = run({ id: 'missing' });
+    delete missing.currentStepId;
+    await db.workflowRuns.bulkPut([mismatch, missing]);
+
+    expect(await listClearedQuarantineWorkflowWaiters()).toEqual([]);
+    expect(quarantineWorkflowTargetAgentId(mismatch)).toBeUndefined();
+    expect(quarantineWorkflowTargetAgentId(missing)).toBeUndefined();
   });
 
   it('rejects mismatched or missing durable current-step checkpoints', () => {
