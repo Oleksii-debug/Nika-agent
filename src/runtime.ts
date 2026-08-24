@@ -1,5 +1,9 @@
-import type { ChatAgent, ContentCommand, ContentResult } from './types';
+import type { ChatAgent, ContentCommand, ContentResult, ExecutionContext } from './types';
 import { appendLog } from './storage';
+
+const agentQueues = new Map<string, Promise<void>>();
+const MAX_MESSAGE_ATTEMPTS = 3;
+const RETRY_BASE_MS = 250;
 
 export async function ensureAgentTab(agent: ChatAgent): Promise<number> {
   const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
@@ -12,23 +16,67 @@ export async function ensureAgentTab(agent: ChatAgent): Promise<number> {
   return created.id;
 }
 
-export async function sendToAgent(agent: ChatAgent, prompt: string): Promise<void> {
-  const tabId = await ensureAgentTab(agent);
-  if (agent.completion.waitForIdle) {
-    await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs);
-  }
-  const result = await contentCommand(tabId, { type: 'send', prompt });
-  if (!result.ok) throw new Error(result.error);
-  await appendLog({ agentId: agent.id, level: 'info', event: 'prompt_sent', detail: prompt.slice(0, 500) });
+export async function sendToAgent(
+  agent: ChatAgent,
+  prompt: string,
+  context: ExecutionContext = {},
+): Promise<void> {
+  await withAgentLease(agent.id, async () => {
+    const tabId = await ensureAgentTab(agent);
+    if (agent.completion.waitForIdle) {
+      await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs);
+    }
+    const result = await contentCommand(tabId, { type: 'send', prompt });
+    if (!result.ok) throw new Error(result.error);
+    await appendLog({
+      agentId: agent.id,
+      ...context,
+      level: 'info',
+      event: 'prompt_sent',
+      detail: prompt.slice(0, 500),
+    });
+  });
 }
 
-export async function captureAgentResponse(agent: ChatAgent): Promise<string> {
-  const tabId = await ensureAgentTab(agent);
-  await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs);
-  const result = await contentCommand(tabId, { type: 'captureLatest' });
-  if (!result.ok || !result.text) throw new Error(result.ok ? 'Response was empty.' : result.error);
-  await appendLog({ agentId: agent.id, level: 'info', event: 'response_captured', detail: result.text.slice(0, 500) });
-  return result.text;
+export async function captureAgentResponse(
+  agent: ChatAgent,
+  context: ExecutionContext = {},
+): Promise<string> {
+  return withAgentLease(agent.id, async () => {
+    const tabId = await ensureAgentTab(agent);
+    await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs);
+    const result = await contentCommand(tabId, { type: 'captureLatest' });
+    if (!result.ok || !result.text) throw new Error(result.ok ? 'Response was empty.' : result.error);
+    await appendLog({
+      agentId: agent.id,
+      ...context,
+      level: 'info',
+      event: 'response_captured',
+      detail: result.text.slice(0, 500),
+    });
+    return result.text;
+  });
+}
+
+export async function waitForAgentIdle(
+  agent: ChatAgent,
+  timeoutOverride?: number,
+  context: ExecutionContext = {},
+): Promise<void> {
+  await withAgentLease(agent.id, async () => {
+    const tabId = await ensureAgentTab(agent);
+    await waitUntilIdle(
+      tabId,
+      timeoutOverride ?? agent.completion.timeoutMs,
+      agent.completion.settleMs,
+    );
+    await appendLog({
+      agentId: agent.id,
+      ...context,
+      level: 'info',
+      event: 'agent_idle',
+    });
+  });
 }
 
 export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: number): Promise<void> {
@@ -48,28 +96,49 @@ export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: 
   throw new Error('Timed out waiting for ChatGPT to become idle.');
 }
 
+export async function withAgentLease<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = agentQueues.get(agentId) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  agentQueues.set(agentId, tail);
+
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (agentQueues.get(agentId) === tail) agentQueues.delete(agentId);
+  }
+}
+
 async function contentCommand(
   tabId: number,
   command: ContentCommand,
   recover = true,
 ): Promise<ContentResult> {
-  try {
-    return (await chrome.tabs.sendMessage(tabId, command)) as ContentResult;
-  } catch (error) {
-    if (!recover) return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  let lastError: unknown;
+  const attempts = recover ? MAX_MESSAGE_ATTEMPTS : 1;
 
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
+      return (await chrome.tabs.sendMessage(tabId, command)) as ContentResult;
+    } catch (error) {
+      lastError = error;
+      if (!recover || attempt === attempts) break;
+
+      await sleep(RETRY_BASE_MS * 2 ** (attempt - 1));
       await chrome.tabs.reload(tabId);
       await waitForTabComplete(tabId, 30_000);
-      await sleep(500);
-      return (await chrome.tabs.sendMessage(tabId, command)) as ContentResult;
-    } catch (retryError) {
-      return {
-        ok: false,
-        error: retryError instanceof Error ? retryError.message : String(retryError ?? error),
-      };
     }
   }
+
+  return {
+    ok: false,
+    error: lastError instanceof Error ? lastError.message : String(lastError),
+  };
 }
 
 async function waitForTabComplete(tabId: number, timeoutMs: number): Promise<void> {
