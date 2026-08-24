@@ -9,6 +9,7 @@ import {
   getWorkflowOutputs,
   getWorkflowRun,
   putWorkflowOutput,
+  verifyWorkflowSnapshot,
 } from './workflow-state';
 import type { ChatAgent, RunSource, WorkflowDefinition } from './types';
 
@@ -19,8 +20,17 @@ export type WorkflowRunOptions = {
 
 export async function runWorkflow(workflow: WorkflowDefinition, options: WorkflowRunOptions = {}): Promise<void> {
   const source = options.source ?? 'workflow';
-  const durable = await createWorkflowRun(workflow.id, source, options.runId);
+  const durable = await createWorkflowRun(workflow, source, options.runId);
   const runId = durable.id;
+
+  if (!(await verifyWorkflowSnapshot(durable))) {
+    const error = new Error('WORKFLOW_REVISION_INVALID: durable workflow snapshot is missing or does not match its revision hash.');
+    await failWorkflowRun(runId, error, true);
+    await appendLog({ workflowId: durable.workflowId, runId, source: durable.source, level: 'error', event: 'workflow_revision_invalid', detail: error.message });
+    throw error;
+  }
+
+  const pinnedWorkflow = durable.workflowSnapshot;
   const agents = await getAgents();
   const byId = new Map(agents.map((agent) => [agent.id, agent]));
   const context = await getWorkflowOutputs(runId);
@@ -28,15 +38,29 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
   let index = persisted?.nextStepIndex ?? 0;
 
   if (index === 0 && !persisted?.currentStepId) {
-    await appendLog({ workflowId: workflow.id, runId, source, level: 'info', event: 'workflow_started' });
+    await appendLog({
+      workflowId: pinnedWorkflow.id,
+      runId,
+      source: durable.source,
+      level: 'info',
+      event: 'workflow_started',
+      detail: `revision:${durable.workflowRevision}`,
+    });
   } else {
-    await appendLog({ workflowId: workflow.id, runId, source, level: 'warning', event: 'workflow_resumed', detail: `step:${index}` });
+    await appendLog({
+      workflowId: pinnedWorkflow.id,
+      runId,
+      source: durable.source,
+      level: 'warning',
+      event: 'workflow_resumed',
+      detail: `revision:${durable.workflowRevision};step:${index}`,
+    });
   }
 
   try {
-    for (; index < workflow.steps.length; index += 1) {
-      const step = workflow.steps[index];
-      const runtimeContext = { workflowId: workflow.id, runId, stepId: step.id, source } as const;
+    for (; index < pinnedWorkflow.steps.length; index += 1) {
+      const step = pinnedWorkflow.steps[index];
+      const runtimeContext = { workflowId: pinnedWorkflow.id, runId, stepId: step.id, source: durable.source } as const;
       const current = await getWorkflowRun(runId);
       let resumeAt = current?.currentStepId === step.id ? current.resumeAt : undefined;
 
@@ -44,6 +68,8 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
         if (step.type === 'delay') resumeAt = new Date(Date.now() + step.milliseconds).toISOString();
         await checkpointStepStarted(runId, step.id, resumeAt);
         await appendLog({ ...runtimeContext, level: 'info', event: 'workflow_step_started', detail: step.type });
+      } else if (current.currentStepId !== step.id) {
+        throw new Error(`WORKFLOW_CHECKPOINT_MISMATCH: persisted step '${current.currentStepId}' does not match pinned step '${step.id}'.`);
       }
 
       switch (step.type) {
@@ -86,11 +112,12 @@ export async function runWorkflow(workflow: WorkflowDefinition, options: Workflo
     }
 
     await completeWorkflowRun(runId);
-    await appendLog({ workflowId: workflow.id, runId, source, level: 'info', event: 'workflow_completed' });
+    await appendLog({ workflowId: pinnedWorkflow.id, runId, source: durable.source, level: 'info', event: 'workflow_completed', detail: `revision:${durable.workflowRevision}` });
   } catch (error) {
-    const needsReview = error instanceof Error && error.message.includes('SEND_AMBIGUOUS');
+    const message = error instanceof Error ? error.message : String(error);
+    const needsReview = message.includes('SEND_AMBIGUOUS') || message.includes('WORKFLOW_CHECKPOINT_MISMATCH') || message.includes('WORKFLOW_REVISION_INVALID');
     await failWorkflowRun(runId, error, needsReview);
-    await appendLog({ workflowId: workflow.id, runId, source, level: 'error', event: needsReview ? 'workflow_needs_review' : 'workflow_failed', detail: error instanceof Error ? error.message : String(error) });
+    await appendLog({ workflowId: pinnedWorkflow.id, runId, source: durable.source, level: 'error', event: needsReview ? 'workflow_needs_review' : 'workflow_failed', detail: message });
     throw error;
   }
 }
