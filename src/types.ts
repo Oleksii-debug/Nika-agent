@@ -49,11 +49,53 @@ export interface ExecutionLog {
   detail?: string;
 }
 
+export type LocatorStrategy = 'testid' | 'aria' | 'css';
+
+export interface LocatorCandidate {
+  strategy: LocatorStrategy;
+  value: string;
+  confidence: 'primary' | 'fallback';
+}
+
+export interface SiteProfile {
+  id: string;
+  version: number;
+  matches: string[];
+  locators: {
+    composer: LocatorCandidate[];
+    send: LocatorCandidate[];
+    stop: LocatorCandidate[];
+    assistantMessage: LocatorCandidate[];
+    userMessage: LocatorCandidate[];
+  };
+}
+
+export interface ChatSnapshot {
+  siteProfileId: string;
+  siteProfileVersion: number;
+  navigationEpoch: number;
+  href: string;
+  title: string;
+  state: 'generating' | 'idle';
+  composerAvailable: boolean;
+  sendAvailable: boolean;
+  assistantMessageCount: number;
+  userMessageCount: number;
+}
+
+export type SendReceipt = {
+  navigationEpoch: number;
+  userMessageCountBefore: number;
+  userMessageCountAfter: number;
+  submittedAt: string;
+};
+
 export type ContentCommand =
   | { type: 'status' }
+  | { type: 'snapshot' }
   | { type: 'send'; prompt: string }
   | { type: 'captureLatest' };
 
 export type ContentResult =
-  | { ok: true; state?: 'generating' | 'idle'; text?: string }
-  | { ok: false; error: string };
+  | { ok: true; state?: 'generating' | 'idle'; text?: string; snapshot?: ChatSnapshot; receipt?: SendReceipt }
+  | { ok: false; error: string; code?: string; snapshot?: ChatSnapshot };
