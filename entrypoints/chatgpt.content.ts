@@ -39,11 +39,24 @@ const SELECTORS = {
   ],
 } as const;
 
+const IDLE_CANDIDATE_DEBOUNCE_MS = 3_000;
 let lastRelevantMutationAt = Date.now();
+let idleCandidateTimer: ReturnType<typeof setTimeout> | undefined;
 
 function startMutationTracking(): void {
   const observer = new MutationObserver((records) => {
-    if (records.some((record) => isRelevantMutation(record))) lastRelevantMutationAt = Date.now();
+    if (!records.some((record) => isRelevantMutation(record))) return;
+    lastRelevantMutationAt = Date.now();
+    if (idleCandidateTimer) clearTimeout(idleCandidateTimer);
+    idleCandidateTimer = setTimeout(() => {
+      const evidence = inspectState();
+      if (evidence.state !== 'idle' || !evidence.composerEditable || evidence.stopControlPresent) return;
+      void chrome.runtime.sendMessage({
+        type: 'nika.chatIdleCandidate',
+        url: location.href,
+        mutationAgeMs: evidence.mutationAgeMs,
+      }).catch(() => undefined);
+    }, IDLE_CANDIDATE_DEBOUNCE_MS);
   });
   observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
 }

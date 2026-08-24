@@ -1,4 +1,4 @@
-import type { ChatAgent, ContentCommand, ContentResult, RunSource } from './types';
+import type { ChatAgent, ContentCommand, ContentResult, RunSource, StateEvidence } from './types';
 import type { SendIntent } from './db';
 import { appendLog } from './storage';
 import { getOrCreateSendIntent, setSendIntentState } from './send-intents';
@@ -103,6 +103,22 @@ export async function reconcileSendIntent(agent: ChatAgent, intent: SendIntent):
   });
 }
 
+export async function inspectAgentState(agent: ChatAgent): Promise<StateEvidence> {
+  return runAgentExclusive(agent.id, async () => {
+    const tabId = await ensureAgentTab(agent);
+    const result = await contentCommand(tabId, { type: 'status' }, { recover: true });
+    if (!result.ok || !result.evidence) throw new Error(result.ok ? 'Chat state evidence is unavailable.' : result.error);
+    return result.evidence;
+  });
+}
+
+export function isStablyIdle(evidence: StateEvidence, settleMs: number): boolean {
+  return evidence.state === 'idle'
+    && evidence.composerEditable
+    && !evidence.stopControlPresent
+    && (evidence.mutationAgeMs ?? settleMs) >= settleMs;
+}
+
 export async function waitForAgentIdle(agent: ChatAgent, timeoutOverride?: number, context: RuntimeExecutionContext = {}): Promise<void> {
   return runAgentExclusive(agent.id, async () => {
     const tabId = await ensureAgentTab(agent);
@@ -128,9 +144,9 @@ export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: 
   while (Date.now() < deadline) {
     const result = await contentCommand(tabId, { type: 'status' }, { recover: true });
     const evidence = result.ok ? result.evidence : undefined;
-    if (result.ok && result.state === 'idle' && evidence?.composerEditable && !evidence.stopControlPresent) {
+    if (result.ok && evidence && isStablyIdle(evidence, settleMs)) {
       idleSince ??= Date.now();
-      if (Date.now() - idleSince >= settleMs && (evidence.mutationAgeMs ?? settleMs) >= settleMs) return;
+      if (Date.now() - idleSince >= Math.min(1000, settleMs)) return;
     } else {
       idleSince = null;
     }

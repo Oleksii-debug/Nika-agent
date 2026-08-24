@@ -1,5 +1,7 @@
-import { db, type DurableWorkflowRun } from './db';
+import { db, type DurableWorkflowRun, type WorkflowWaitKind } from './db';
 import type { RunSource, WorkflowDefinition } from './types';
+
+export const WORKFLOW_WAKE_PREFIX = 'nika.workflow.wake.';
 
 export async function createWorkflowRun(
   workflow: WorkflowDefinition,
@@ -35,19 +37,68 @@ export async function getRecoverableWorkflowRuns(): Promise<DurableWorkflowRun[]
   return db.workflowRuns.where('state').equals('running').toArray();
 }
 
-export async function checkpointStepStarted(runId: string, stepId: string, resumeAt?: string): Promise<void> {
+export async function checkpointStepStarted(
+  runId: string,
+  stepId: string,
+  resumeAt?: string,
+  waitDeadlineAt?: string,
+): Promise<void> {
   await db.workflowRuns.update(runId, {
     currentStepId: stepId,
     resumeAt,
+    waitDeadlineAt,
     updatedAt: new Date().toISOString(),
   });
 }
 
+export async function checkpointWorkflowWait(
+  runId: string,
+  waitKind: WorkflowWaitKind,
+  wakeAt: string,
+  waitDeadlineAt?: string,
+): Promise<void> {
+  await db.workflowRuns.update(runId, {
+    waitKind,
+    wakeAt,
+    waitDeadlineAt,
+    updatedAt: new Date().toISOString(),
+  });
+  await ensureWorkflowWakeAlarm(runId, wakeAt);
+}
+
+export async function clearWorkflowWait(runId: string): Promise<void> {
+  await chrome.alarms.clear(workflowWakeAlarmName(runId));
+  await db.workflowRuns.update(runId, {
+    wakeAt: undefined,
+    waitKind: undefined,
+    waitDeadlineAt: undefined,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+export async function ensureWorkflowWakeAlarm(runId: string, wakeAt: string): Promise<void> {
+  const when = Date.parse(wakeAt);
+  if (!Number.isFinite(when)) throw new Error(`WORKFLOW_WAKE_INVALID: '${wakeAt}' is not a valid wake timestamp.`);
+  await chrome.alarms.create(workflowWakeAlarmName(runId), { when: Math.max(Date.now() + 250, when) });
+}
+
+export function workflowWakeAlarmName(runId: string): string {
+  return `${WORKFLOW_WAKE_PREFIX}${runId}`;
+}
+
+export function workflowRunIdFromAlarm(name: string): string | undefined {
+  return name.startsWith(WORKFLOW_WAKE_PREFIX) ? name.slice(WORKFLOW_WAKE_PREFIX.length) : undefined;
+}
+
 export async function checkpointStepCompleted(runId: string, nextStepIndex: number): Promise<void> {
+  await chrome.alarms.clear(workflowWakeAlarmName(runId));
   await db.workflowRuns.update(runId, {
     nextStepIndex,
     currentStepId: undefined,
     resumeAt: undefined,
+    wakeAt: undefined,
+    waitKind: undefined,
+    waitDeadlineAt: undefined,
     lastError: undefined,
     updatedAt: new Date().toISOString(),
   });
@@ -55,18 +106,26 @@ export async function checkpointStepCompleted(runId: string, nextStepIndex: numb
 
 export async function completeWorkflowRun(runId: string): Promise<void> {
   const now = new Date().toISOString();
+  await chrome.alarms.clear(workflowWakeAlarmName(runId));
   await db.workflowRuns.update(runId, {
     state: 'completed',
     completedAt: now,
     currentStepId: undefined,
     resumeAt: undefined,
+    wakeAt: undefined,
+    waitKind: undefined,
+    waitDeadlineAt: undefined,
     updatedAt: now,
   });
 }
 
 export async function failWorkflowRun(runId: string, error: unknown, needsReview = false): Promise<void> {
+  await chrome.alarms.clear(workflowWakeAlarmName(runId));
   await db.workflowRuns.update(runId, {
     state: needsReview ? 'needs_review' : 'failed',
+    wakeAt: undefined,
+    waitKind: undefined,
+    waitDeadlineAt: undefined,
     lastError: error instanceof Error ? error.message : String(error),
     updatedAt: new Date().toISOString(),
   });

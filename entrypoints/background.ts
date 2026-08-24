@@ -2,7 +2,14 @@ import { appendLog, getAgents, getWorkflows } from '../src/storage';
 import { reconcileSendIntent, sendToAgent } from '../src/runtime';
 import { getSendIntentForJob } from '../src/send-intents';
 import { runWorkflow } from '../src/workflow';
-import { failWorkflowRun, getRecoverableWorkflowRuns, verifyWorkflowSnapshot } from '../src/workflow-state';
+import {
+  ensureWorkflowWakeAlarm,
+  failWorkflowRun,
+  getRecoverableWorkflowRuns,
+  getWorkflowRun,
+  verifyWorkflowSnapshot,
+  workflowRunIdFromAlarm,
+} from '../src/workflow-state';
 import {
   claimNextDueJob,
   enqueueManualAgent,
@@ -30,11 +37,21 @@ export default defineBackground(() => {
     if (area === 'local' && changes['nika.agents']) void initializeScheduler();
   });
   chrome.alarms.onAlarm.addListener((alarm) => {
+    const workflowRunId = workflowRunIdFromAlarm(alarm.name);
+    if (workflowRunId) {
+      void resumeWorkflowRun(workflowRunId);
+      return;
+    }
     if (alarm.name === 'nika.scheduler' || alarm.name === 'nika.scheduler.safety') void reconcileAndDrain();
   });
-  chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
     if (!message || typeof message !== 'object') return;
-    const msg = message as { type?: string; agentId?: string; workflowId?: string; prompt?: string };
+    const msg = message as { type?: string; agentId?: string; workflowId?: string; prompt?: string; url?: string };
+    if (msg.type === 'nika.chatIdleCandidate') {
+      const sourceUrl = sender.tab?.url ?? msg.url;
+      if (sourceUrl) void resumeIdleWaitsForUrl(sourceUrl);
+      return;
+    }
     if (msg.type === 'nika.runAgent' && msg.agentId) {
       void enqueueManualAgent(msg.agentId, msg.prompt).then(async () => { await drainJobs(); sendResponse({ ok: true }); }).catch((error) => sendResponse({ ok: false, error: String(error) }));
       return true;
@@ -63,21 +80,69 @@ async function reconcileAndDrain(): Promise<void> {
 }
 
 async function resumeDurableWorkflows(): Promise<void> {
+  const now = Date.now();
   for (const run of await getRecoverableWorkflowRuns()) {
-    if (activeRecoveredWorkflowRuns.has(run.id)) continue;
+    if (run.wakeAt) {
+      const wakeAt = Date.parse(run.wakeAt);
+      if (!Number.isFinite(wakeAt)) {
+        const detail = `Persisted workflow wake timestamp is invalid: ${run.wakeAt}`;
+        await failWorkflowRun(run.id, detail, true);
+        await appendLog({ workflowId: run.workflowId, runId: run.id, source: run.source, level: 'error', event: 'workflow_resume_blocked', detail });
+        continue;
+      }
+      if (wakeAt > now) {
+        await ensureWorkflowWakeAlarm(run.id, run.wakeAt);
+        continue;
+      }
+    }
+    await resumeWorkflowRun(run.id);
+  }
+}
 
-    if (!(await verifyWorkflowSnapshot(run))) {
-      const detail = 'Pinned workflow snapshot is missing or failed revision verification; automatic resume is blocked.';
+async function resumeIdleWaitsForUrl(url: string): Promise<void> {
+  const agents = await getAgents();
+  const matchingAgentIds = new Set(agents.filter((agent) => agent.enabled && sameChatUrl(agent.url, url)).map((agent) => agent.id));
+  if (!matchingAgentIds.size) return;
+
+  for (const run of await getRecoverableWorkflowRuns()) {
+    if (run.waitKind !== 'wait_idle' || !run.currentStepId) continue;
+    const step = run.workflowSnapshot.steps[run.nextStepIndex];
+    if (!step || step.id !== run.currentStepId || step.type !== 'wait_idle') continue;
+    if (!matchingAgentIds.has(step.agentId)) continue;
+    await resumeWorkflowRun(run.id, true);
+  }
+}
+
+async function resumeWorkflowRun(runId: string, ignoreWakeAt = false): Promise<void> {
+  if (activeRecoveredWorkflowRuns.has(runId)) return;
+  const run = await getWorkflowRun(runId);
+  if (!run || run.state !== 'running') return;
+
+  if (!(await verifyWorkflowSnapshot(run))) {
+    const detail = 'Pinned workflow snapshot is missing or failed revision verification; automatic resume is blocked.';
+    await failWorkflowRun(run.id, detail, true);
+    await appendLog({ workflowId: run.workflowId, runId: run.id, source: run.source, level: 'error', event: 'workflow_resume_blocked', detail });
+    return;
+  }
+
+  if (!ignoreWakeAt && run.wakeAt) {
+    const wakeAt = Date.parse(run.wakeAt);
+    if (!Number.isFinite(wakeAt)) {
+      const detail = `Persisted workflow wake timestamp is invalid: ${run.wakeAt}`;
       await failWorkflowRun(run.id, detail, true);
       await appendLog({ workflowId: run.workflowId, runId: run.id, source: run.source, level: 'error', event: 'workflow_resume_blocked', detail });
-      continue;
+      return;
     }
-
-    activeRecoveredWorkflowRuns.add(run.id);
-    void runWorkflow(run.workflowSnapshot, { runId: run.id, source: run.source })
-      .catch(() => undefined)
-      .finally(() => activeRecoveredWorkflowRuns.delete(run.id));
+    if (wakeAt > Date.now()) {
+      await ensureWorkflowWakeAlarm(run.id, run.wakeAt);
+      return;
+    }
   }
+
+  activeRecoveredWorkflowRuns.add(run.id);
+  void runWorkflow(run.workflowSnapshot, { runId: run.id, source: run.source })
+    .catch(() => undefined)
+    .finally(() => activeRecoveredWorkflowRuns.delete(run.id));
 }
 
 async function reconcileInterruptedSends(agents: Awaited<ReturnType<typeof getAgents>>): Promise<void> {
@@ -157,4 +222,14 @@ async function runWorkflowNow(workflowId: string, source: RunSource): Promise<vo
   const workflow = (await getWorkflows()).find((candidate) => candidate.id === workflowId);
   if (!workflow || !workflow.enabled) return;
   await runWorkflow(workflow, { runId: crypto.randomUUID(), source });
+}
+
+function sameChatUrl(a: string, b: string): boolean {
+  try {
+    const left = new URL(a);
+    const right = new URL(b);
+    return left.origin === right.origin && left.pathname.replace(/\/$/, '') === right.pathname.replace(/\/$/, '');
+  } catch {
+    return a === b;
+  }
 }
