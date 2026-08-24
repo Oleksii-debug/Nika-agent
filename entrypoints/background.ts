@@ -44,9 +44,14 @@ export default defineBackground(() => {
     }
     if (alarm.name === 'nika.scheduler' || alarm.name === 'nika.scheduler.safety') void reconcileAndDrain();
   });
-  chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
     if (!message || typeof message !== 'object') return;
-    const msg = message as { type?: string; agentId?: string; workflowId?: string; prompt?: string };
+    const msg = message as { type?: string; agentId?: string; workflowId?: string; prompt?: string; url?: string };
+    if (msg.type === 'nika.chatIdleCandidate') {
+      const sourceUrl = sender.tab?.url ?? msg.url;
+      if (sourceUrl) void resumeIdleWaitsForUrl(sourceUrl);
+      return;
+    }
     if (msg.type === 'nika.runAgent' && msg.agentId) {
       void enqueueManualAgent(msg.agentId, msg.prompt).then(async () => { await drainJobs(); sendResponse({ ok: true }); }).catch((error) => sendResponse({ ok: false, error: String(error) }));
       return true;
@@ -94,7 +99,21 @@ async function resumeDurableWorkflows(): Promise<void> {
   }
 }
 
-async function resumeWorkflowRun(runId: string): Promise<void> {
+async function resumeIdleWaitsForUrl(url: string): Promise<void> {
+  const agents = await getAgents();
+  const matchingAgentIds = new Set(agents.filter((agent) => agent.enabled && sameChatUrl(agent.url, url)).map((agent) => agent.id));
+  if (!matchingAgentIds.size) return;
+
+  for (const run of await getRecoverableWorkflowRuns()) {
+    if (run.waitKind !== 'wait_idle' || !run.currentStepId) continue;
+    const step = run.workflowSnapshot.steps[run.nextStepIndex];
+    if (!step || step.id !== run.currentStepId || step.type !== 'wait_idle') continue;
+    if (!matchingAgentIds.has(step.agentId)) continue;
+    await resumeWorkflowRun(run.id, true);
+  }
+}
+
+async function resumeWorkflowRun(runId: string, ignoreWakeAt = false): Promise<void> {
   if (activeRecoveredWorkflowRuns.has(runId)) return;
   const run = await getWorkflowRun(runId);
   if (!run || run.state !== 'running') return;
@@ -106,7 +125,7 @@ async function resumeWorkflowRun(runId: string): Promise<void> {
     return;
   }
 
-  if (run.wakeAt) {
+  if (!ignoreWakeAt && run.wakeAt) {
     const wakeAt = Date.parse(run.wakeAt);
     if (!Number.isFinite(wakeAt)) {
       const detail = `Persisted workflow wake timestamp is invalid: ${run.wakeAt}`;
@@ -203,4 +222,14 @@ async function runWorkflowNow(workflowId: string, source: RunSource): Promise<vo
   const workflow = (await getWorkflows()).find((candidate) => candidate.id === workflowId);
   if (!workflow || !workflow.enabled) return;
   await runWorkflow(workflow, { runId: crypto.randomUUID(), source });
+}
+
+function sameChatUrl(a: string, b: string): boolean {
+  try {
+    const left = new URL(a);
+    const right = new URL(b);
+    return left.origin === right.origin && left.pathname.replace(/\/$/, '') === right.pathname.replace(/\/$/, '');
+  } catch {
+    return a === b;
+  }
 }
