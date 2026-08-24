@@ -1,5 +1,5 @@
 import { appendLog, getAgents, getWorkflows } from '../src/storage';
-import { acquireAgentLease, purgeExpiredLeases, releaseAgentLease } from '../src/db';
+import { acquireAgentLease, purgeExpiredLeases, releaseAgentLease, startLeaseHeartbeat } from '../src/db';
 import { sendToAgent } from '../src/runtime';
 import { recoverInterruptedWorkflows, resumeWorkflowRun, runWorkflow } from '../src/workflow';
 
@@ -82,8 +82,14 @@ async function runAgentNow(agentId: string, prompt?: string, source: 'manual' | 
     throw new Error(message);
   }
 
+  let leaseLost = false;
+  const stopHeartbeat = startLeaseHeartbeat([lease], () => {
+    leaseLost = true;
+  });
+
   try {
     await sendToAgent(agent, prompt?.trim() || agent.defaultPrompt, { runId: ownerRunId });
+    if (leaseLost) throw new Error(`Execution lease for agent '${agent.id}' was lost.`);
   } catch (error) {
     await appendLog({
       agentId,
@@ -94,6 +100,7 @@ async function runAgentNow(agentId: string, prompt?: string, source: 'manual' | 
     });
     throw error;
   } finally {
+    stopHeartbeat();
     await releaseAgentLease(lease);
   }
 }
