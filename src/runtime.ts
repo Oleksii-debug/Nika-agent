@@ -1,9 +1,10 @@
-import type { ChatAgent, ContentCommand, ContentResult, RunSource, StateEvidence } from './types';
+import type { ChatAgent, ChatState, ContentCommand, ContentResult, RunSource, StateEvidence } from './types';
 import type { SendIntent } from './db';
 import { appendLog } from './storage';
 import { getOrCreateSendIntent, setSendIntentState } from './send-intents';
 
 const agentQueues = new Map<string, Promise<void>>();
+const HARD_BLOCKED_STATES = new Set<ChatState>(['blocked', 'logged_out', 'rate_limited', 'verification_required', 'unsupported']);
 
 export type RuntimeExecutionContext = {
   runId?: string;
@@ -50,7 +51,7 @@ export async function sendToAgent(
 
     const status = await contentCommand(tabId, { type: 'status' }, { recover: true });
     if (!status.ok || !status.evidence) throw new Error(status.ok ? 'Chat state evidence is unavailable.' : status.error);
-    if (status.evidence.state !== 'idle') throw new Error(`Chat is not send-safe: ${status.evidence.state}.`);
+    if (status.evidence.state !== 'idle') throw new Error(describeUnsafeEvidence(status.evidence));
 
     const intentInput: Parameters<typeof getOrCreateSendIntent>[0] = {
       agentId: agent.id,
@@ -63,7 +64,7 @@ export async function sendToAgent(
 
     if (intent.state === 'confirmed') return;
     if (intent.state === 'dispatching' || intent.state === 'ambiguous') {
-      const presence = await reconcileSendIntent(agent, intent);
+      const presence = await reconcileSendIntentUnlocked(agent, intent);
       if (presence === 'confirmed') return;
       if (presence === 'ambiguous') throw new Error('SEND_AMBIGUOUS: persisted send intent cannot be uniquely reconciled.');
     }
@@ -88,20 +89,22 @@ export async function sendToAgent(
 }
 
 export async function reconcileSendIntent(agent: ChatAgent, intent: SendIntent): Promise<'confirmed' | 'absent' | 'ambiguous'> {
-  return runAgentExclusive(agent.id, async () => {
-    const tabId = await ensureAgentTab(agent);
-    const result = await contentCommand(tabId, {
-      type: 'verifyPrompt',
-      promptHash: intent.promptHash,
-      baselineUserTurnCount: intent.baselineUserTurnCount,
-    }, { recover: true });
-    if (!result.ok || !result.presence) {
-      await setSendIntentState(intent.id, 'ambiguous', result.ok ? 'Prompt presence result missing.' : result.error);
-      return 'ambiguous';
-    }
-    await setSendIntentState(intent.id, result.presence, result.detail);
-    return result.presence;
-  });
+  return runAgentExclusive(agent.id, () => reconcileSendIntentUnlocked(agent, intent));
+}
+
+async function reconcileSendIntentUnlocked(agent: ChatAgent, intent: SendIntent): Promise<'confirmed' | 'absent' | 'ambiguous'> {
+  const tabId = await ensureAgentTab(agent);
+  const result = await contentCommand(tabId, {
+    type: 'verifyPrompt',
+    promptHash: intent.promptHash,
+    baselineUserTurnCount: intent.baselineUserTurnCount,
+  }, { recover: true });
+  if (!result.ok || !result.presence) {
+    await setSendIntentState(intent.id, 'ambiguous', result.ok ? 'Prompt presence result missing.' : result.error);
+    return 'ambiguous';
+  }
+  await setSendIntentState(intent.id, result.presence, result.detail);
+  return result.presence;
 }
 
 export async function inspectAgentState(agent: ChatAgent): Promise<StateEvidence> {
@@ -145,6 +148,7 @@ export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: 
   while (Date.now() < deadline) {
     const result = await contentCommand(tabId, { type: 'status' }, { recover: true });
     const evidence = result.ok ? result.evidence : undefined;
+    if (evidence && HARD_BLOCKED_STATES.has(evidence.state)) throw new Error(describeUnsafeEvidence(evidence));
     if (result.ok && evidence && isStablyIdle(evidence, settleMs)) {
       idleSince ??= Date.now();
       if (Date.now() - idleSince >= Math.min(1000, settleMs)) return;
@@ -154,6 +158,12 @@ export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: 
     await sleep(1000);
   }
   throw new Error('Timed out waiting for ChatGPT to become stably idle.');
+}
+
+function describeUnsafeEvidence(evidence: StateEvidence): string {
+  const blocker = evidence.blockerKind ? `/${evidence.blockerKind}` : '';
+  const detail = evidence.visibleError ? `: ${evidence.visibleError}` : '';
+  return `CHAT_SURFACE_BLOCKED[${evidence.state}${blocker}]${detail}`;
 }
 
 type ContentCommandOptions = { recover: boolean; attempts?: number };
