@@ -35,6 +35,29 @@ describe('operator recovery', () => {
     expect(await db.targetClaims.get('https://chatgpt.com/c/abc')).toBeTruthy();
   });
 
+  it('retains the physical-target claim for an unresolved send across a worker-style database restart', async () => {
+    await putJob('job-restart');
+    await putIntent('intent-restart', 'job-restart', 'dispatching');
+    const targetKey = 'https://chatgpt.com/c/restart-ambiguous';
+    await db.targetClaims.put({
+      targetKey, ownerKind: 'job', ownerId: 'job-restart', operationId: 'job:job-restart', acquiredAt: now, updatedAt: now,
+    });
+
+    db.close();
+    await db.open();
+
+    const persistedClaim = await db.targetClaims.get(targetKey);
+    expect(persistedClaim?.ownerId).toBe('job-restart');
+    expect(persistedClaim?.operationId).toBe('job:job-restart');
+
+    const recovery = (await listRecoveryCases()).find((item) => item.subjectId === 'job-restart');
+    if (!recovery) throw new Error('Expected the unresolved restarted job to remain an operator recovery case.');
+    expect(recovery.allowedActions).not.toContain('release_if_safe');
+    expect(recovery.allowedActions).not.toContain('cancel');
+    await expect(recoverSubject('job', 'job-restart', 'release_if_safe')).rejects.toThrow('RECOVERY_UNSAFE_RELEASE');
+    expect(await db.targetClaims.get(targetKey)).toBeTruthy();
+  });
+
   it('marks a confirmed job succeeded and releases its owned target', async () => {
     await putJob('job-2');
     await putIntent('intent-2', 'job-2', 'confirmed');
