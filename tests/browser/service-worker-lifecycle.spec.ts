@@ -45,14 +45,17 @@ async function wakeBackground(context: BrowserContext, extensionId: string): Pro
   }
 }
 
-test('MV3 background termination produces a distinct worker boot before recovery work continues', async () => {
+test('MV3 runtime restart produces a distinct worker boot before recovery work continues', async () => {
   const { context, worker, extensionId } = await launchExtension();
   try {
     const firstBoot = await bootIdentity(worker);
     const closed = worker.waitForEvent('close');
 
+    // ServiceWorkerGlobalScope has no close() API. chrome.runtime.reload() is a deterministic
+    // forced extension-runtime restart: the old MV3 worker/context is destroyed while durable
+    // browser storage survives, making it a conservative lifecycle oracle for restart recovery.
     await worker.evaluate(() => {
-      self.close();
+      chrome.runtime.reload();
     });
     await closed;
 
