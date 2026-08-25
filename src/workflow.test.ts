@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ChatAgent, WorkflowDefinition } from './types';
+import type { ChatAgent, RunRecord, WorkflowDefinition } from './types';
 
 const mocks = vi.hoisted(() => ({
   appendLog: vi.fn(),
@@ -7,6 +7,11 @@ const mocks = vi.hoisted(() => ({
   captureAgentResponse: vi.fn(),
   sendToAgent: vi.fn(),
   waitForAgentIdle: vi.fn(),
+  acquireAgentLease: vi.fn(),
+  createRunRecord: vi.fn(),
+  getRunRecord: vi.fn(),
+  releaseAgentLease: vi.fn(),
+  saveRunRecord: vi.fn(),
 }));
 
 vi.mock('./storage', () => ({
@@ -20,7 +25,15 @@ vi.mock('./runtime', () => ({
   waitForAgentIdle: mocks.waitForAgentIdle,
 }));
 
-import { interpolate, runWorkflow } from './workflow';
+vi.mock('./run-store', () => ({
+  acquireAgentLease: mocks.acquireAgentLease,
+  createRunRecord: mocks.createRunRecord,
+  getRunRecord: mocks.getRunRecord,
+  releaseAgentLease: mocks.releaseAgentLease,
+  saveRunRecord: mocks.saveRunRecord,
+}));
+
+import { interpolate, resumeWorkflow, runWorkflow } from './workflow';
 
 const agent: ChatAgent = {
   id: 'developer',
@@ -35,6 +48,22 @@ const agent: ChatAgent = {
   tags: [],
 };
 
+function makeRun(overrides: Partial<RunRecord> = {}): RunRecord {
+  return {
+    runId: 'run-1',
+    workflowId: 'workflow',
+    currentStepIndex: 0,
+    stepState: 'pending',
+    state: 'queued',
+    context: {},
+    createdAt: '2026-08-25T00:00:00.000Z',
+    updatedAt: '2026-08-25T00:00:00.000Z',
+    retryCount: 0,
+    correlationId: 'correlation-1',
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.getAgents.mockResolvedValue([agent]);
@@ -42,6 +71,10 @@ beforeEach(() => {
   mocks.sendToAgent.mockResolvedValue(undefined);
   mocks.waitForAgentIdle.mockResolvedValue(undefined);
   mocks.captureAgentResponse.mockResolvedValue('captured response');
+  mocks.acquireAgentLease.mockResolvedValue(true);
+  mocks.releaseAgentLease.mockResolvedValue(undefined);
+  mocks.saveRunRecord.mockResolvedValue(undefined);
+  mocks.createRunRecord.mockResolvedValue(makeRun());
 });
 
 describe('runWorkflow', () => {
@@ -60,6 +93,25 @@ describe('runWorkflow', () => {
     expect(mocks.captureAgentResponse).not.toHaveBeenCalled();
   });
 
+  it('checkpoints an executing step before dispatching a side effect', async () => {
+    const workflow: WorkflowDefinition = {
+      id: 'workflow',
+      projectId: 'project',
+      name: 'Checkpoint',
+      enabled: true,
+      steps: [{ id: 'send-1', type: 'send', agentId: agent.id, prompt: 'Implement feature' }],
+    };
+
+    await runWorkflow(workflow);
+
+    const dispatchOrder = mocks.saveRunRecord.mock.invocationCallOrder[0];
+    const sendOrder = mocks.sendToAgent.mock.invocationCallOrder[0];
+    expect(dispatchOrder).toBeLessThan(sendOrder);
+    const checkpoint = mocks.saveRunRecord.mock.calls[0]?.[0] as RunRecord;
+    expect(checkpoint.stepState).toBe('executing');
+    expect(checkpoint.currentStepId).toBe('send-1');
+  });
+
   it('passes a stable run id and step id into side-effecting runtime calls', async () => {
     const workflow: WorkflowDefinition = {
       id: 'workflow',
@@ -73,13 +125,25 @@ describe('runWorkflow', () => {
 
     expect(mocks.sendToAgent).toHaveBeenCalledTimes(1);
     const provenance = mocks.sendToAgent.mock.calls[0]?.[2] as { runId?: string; stepId?: string } | undefined;
-    expect(provenance?.runId).toEqual(expect.any(String));
-    expect(provenance?.stepId).toBe('send-1');
+    expect(provenance).toEqual({ runId: 'run-1', stepId: 'send-1' });
+  });
 
-    const startedLog = mocks.appendLog.mock.calls.find(
-      ([entry]) => (entry as { event?: string }).event === 'workflow_started',
-    )?.[0] as { runId?: string } | undefined;
-    expect(startedLog?.runId).toBe(provenance?.runId);
+  it('blocks automatic replay when a send was interrupted in executing state', async () => {
+    const workflow: WorkflowDefinition = {
+      id: 'workflow',
+      projectId: 'project',
+      name: 'Recover send',
+      enabled: true,
+      steps: [{ id: 'send-1', type: 'send', agentId: agent.id, prompt: 'Implement feature' }],
+    };
+    const interrupted = makeRun({ state: 'running', stepState: 'executing', currentStepId: 'send-1' });
+    mocks.getRunRecord.mockResolvedValue(interrupted);
+
+    await resumeWorkflow(workflow, interrupted.runId);
+
+    expect(mocks.sendToAgent).not.toHaveBeenCalled();
+    expect(interrupted.state).toBe('needs_reconciliation');
+    expect(mocks.saveRunRecord).toHaveBeenCalledWith(interrupted);
   });
 });
 
