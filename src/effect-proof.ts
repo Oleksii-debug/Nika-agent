@@ -1,12 +1,12 @@
 import type { EffectProofObservation } from './types';
 
 export type EvaluateEffectProofInput = {
-  baselinePageUrl?: string;
-  observedPageUrl?: string;
+  baselinePageUrl?: string | undefined;
+  observedPageUrl?: string | undefined;
   baselineUserTurnCount: number;
   observedUserTurnCount: number;
   matches: number;
-  observedAt?: string;
+  observedAt?: string | undefined;
 };
 
 export function evaluateSendEffectProof(input: EvaluateEffectProofInput): EffectProofObservation {
