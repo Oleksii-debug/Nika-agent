@@ -4,6 +4,18 @@ import { appendLog } from './storage';
 const agentQueues = new Map<string, Promise<void>>();
 const RETRY_DELAYS_MS = [250, 750, 2_000] as const;
 
+export type ContentCommandRetryPolicy = 'none' | 'read_only';
+
+export function retryPolicyForContentCommand(command: ContentCommand): ContentCommandRetryPolicy {
+  switch (command.type) {
+    case 'send':
+      return 'none';
+    case 'status':
+    case 'captureLatest':
+      return 'read_only';
+  }
+}
+
 export async function ensureAgentTab(agent: ChatAgent): Promise<number> {
   const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
   const exact = tabs.find((tab) => tab.url === agent.url && typeof tab.id === 'number');
@@ -25,8 +37,15 @@ export async function sendToAgent(
     if (agent.completion.waitForIdle) {
       await waitUntilIdle(tabId, agent.completion.timeoutMs, agent.completion.settleMs);
     }
+
+    // SEND is ambiguity-sensitive and irreversible. A transport failure after the
+    // content script receives this command cannot prove that no external effect
+    // occurred, so it must never be replayed or repaired by reloading the page.
     const result = await contentCommand(tabId, { type: 'send', prompt });
-    if (!result.ok) throw new Error(result.error);
+    if (!result.ok) {
+      throw new Error(`SEND_UNCERTAIN: ${result.error}`);
+    }
+
     await appendLog({
       agentId: agent.id,
       ...provenance,
@@ -69,7 +88,7 @@ export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: 
   let idleSince: number | null = null;
 
   while (Date.now() < deadline) {
-    const result = await contentCommand(tabId, { type: 'status' }, false);
+    const result = await contentCommand(tabId, { type: 'status' });
     if (result.ok && result.state === 'idle') {
       idleSince ??= Date.now();
       if (Date.now() - idleSince >= settleMs) return;
@@ -81,12 +100,9 @@ export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: 
   throw new Error('Timed out waiting for ChatGPT to become idle.');
 }
 
-async function contentCommand(
-  tabId: number,
-  command: ContentCommand,
-  recover = true,
-): Promise<ContentResult> {
-  const attempts = recover ? RETRY_DELAYS_MS.length + 1 : 1;
+async function contentCommand(tabId: number, command: ContentCommand): Promise<ContentResult> {
+  const retryPolicy = retryPolicyForContentCommand(command);
+  const attempts = retryPolicy === 'read_only' ? RETRY_DELAYS_MS.length + 1 : 1;
   let lastError: unknown;
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -95,16 +111,6 @@ async function contentCommand(
     } catch (error) {
       lastError = error;
       if (attempt === attempts - 1) break;
-
-      if (attempt === 0) {
-        try {
-          await chrome.tabs.reload(tabId);
-          await waitForTabComplete(tabId, 30_000);
-        } catch (reloadError) {
-          lastError = reloadError;
-        }
-      }
-
       await sleep(RETRY_DELAYS_MS[attempt] ?? RETRY_DELAYS_MS.at(-1) ?? 2_000);
     }
   }
@@ -134,17 +140,17 @@ async function waitForTabComplete(tabId: number, timeoutMs: number): Promise<voi
   const current = await chrome.tabs.get(tabId);
   if (current.status === 'complete') return;
   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(listener);
-      reject(new Error('Timed out loading ChatGPT tab.'));
-    }, timeoutMs);
-    const listener = (updatedId: number, info: chrome.tabs.TabChangeInfo) => {
+    const listener: Parameters<typeof chrome.tabs.onUpdated.addListener>[0] = (updatedId, info) => {
       if (updatedId === tabId && info.status === 'complete') {
         clearTimeout(timer);
         chrome.tabs.onUpdated.removeListener(listener);
         resolve();
       }
     };
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error('Timed out loading ChatGPT tab.'));
+    }, timeoutMs);
     chrome.tabs.onUpdated.addListener(listener);
   });
 }
