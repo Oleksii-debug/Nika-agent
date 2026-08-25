@@ -1,19 +1,29 @@
 import { appendLog, getAgents, getWorkflows } from '../src/storage';
 import { sendToAgent } from '../src/runtime';
-import { runWorkflow } from '../src/workflow';
+import { clearExpiredLeases, getRunRecord, listActiveRuns } from '../src/run-store';
+import {
+  RUN_ALARM_PREFIX,
+  reconcileWorkflowRun,
+  resumeWorkflow,
+  runWorkflow,
+  type ReconciliationResolution,
+} from '../src/workflow';
+
+const AGENT_ALARM_PREFIX = 'agent:';
+const RECONCILIATION_RESOLUTIONS = new Set<ReconciliationResolution>(['assume_completed', 'retry', 'fail']);
 
 export default defineBackground(() => {
   chrome.runtime.onInstalled.addListener(() => {
-    void rebuildAlarms();
+    void initializeRuntime();
   });
 
   chrome.runtime.onStartup.addListener(() => {
-    void rebuildAlarms();
+    void initializeRuntime();
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && (changes['nika.agents'] || changes['nika.workflows'])) {
-      void rebuildAlarms();
+      void rebuildAgentAlarms();
     }
   });
 
@@ -23,35 +33,105 @@ export default defineBackground(() => {
 
   chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
     if (!message || typeof message !== 'object') return;
-    const msg = message as { type?: string; agentId?: string; workflowId?: string; prompt?: string };
+    const msg = message as {
+      type?: string;
+      agentId?: string;
+      workflowId?: string;
+      runId?: string;
+      prompt?: string;
+      resolution?: string;
+    };
+
     if (msg.type === 'nika.runAgent' && msg.agentId) {
-      void runAgentNow(msg.agentId, msg.prompt).then(() => sendResponse({ ok: true })).catch((error) => sendResponse({ ok: false, error: String(error) }));
+      void runAgentNow(msg.agentId, msg.prompt)
+        .then(() => sendResponse({ ok: true }))
+        .catch((error) => sendResponse({ ok: false, error: String(error) }));
       return true;
     }
+
     if (msg.type === 'nika.runWorkflow' && msg.workflowId) {
-      void runWorkflowNow(msg.workflowId).then(() => sendResponse({ ok: true })).catch((error) => sendResponse({ ok: false, error: String(error) }));
+      void runWorkflowNow(msg.workflowId)
+        .then(() => sendResponse({ ok: true }))
+        .catch((error) => sendResponse({ ok: false, error: String(error) }));
+      return true;
+    }
+
+    if (msg.type === 'nika.listActiveRuns') {
+      void listActiveRuns()
+        .then((runs) => sendResponse({ ok: true, runs }))
+        .catch((error) => sendResponse({ ok: false, error: String(error) }));
+      return true;
+    }
+
+    if (msg.type === 'nika.reconcileRun' && msg.runId && isReconciliationResolution(msg.resolution)) {
+      void reconcileRunNow(msg.runId, msg.resolution)
+        .then(() => sendResponse({ ok: true }))
+        .catch((error) => sendResponse({ ok: false, error: String(error) }));
       return true;
     }
   });
 });
 
-async function rebuildAlarms(): Promise<void> {
-  await chrome.alarms.clearAll();
+async function initializeRuntime(): Promise<void> {
+  await clearExpiredLeases();
+  await rebuildAgentAlarms();
+  await reconcileRuns();
+}
+
+async function rebuildAgentAlarms(): Promise<void> {
+  const existing = await chrome.alarms.getAll();
+  await Promise.all(
+    existing
+      .filter((alarm) => alarm.name.startsWith(AGENT_ALARM_PREFIX))
+      .map((alarm) => chrome.alarms.clear(alarm.name)),
+  );
+
   const agents = await getAgents();
   for (const agent of agents) {
     if (!agent.enabled || !agent.schedule.enabled) continue;
     if (agent.schedule.kind === 'interval') {
-      chrome.alarms.create(`agent:${agent.id}`, { periodInMinutes: Math.max(1, agent.schedule.minutes) });
+      chrome.alarms.create(`${AGENT_ALARM_PREFIX}${agent.id}`, {
+        periodInMinutes: Math.max(1, agent.schedule.minutes),
+      });
     } else if (agent.schedule.kind === 'once') {
       const when = Date.parse(agent.schedule.at);
-      if (Number.isFinite(when) && when > Date.now()) chrome.alarms.create(`agent:${agent.id}`, { when });
+      if (Number.isFinite(when) && when > Date.now()) {
+        chrome.alarms.create(`${AGENT_ALARM_PREFIX}${agent.id}`, { when });
+      }
     }
   }
 }
 
+async function reconcileRuns(): Promise<void> {
+  const workflows = new Map((await getWorkflows()).map((workflow) => [workflow.id, workflow]));
+  for (const run of await listActiveRuns()) {
+    if (run.state === 'needs_reconciliation') continue;
+    const workflow = workflows.get(run.workflowId);
+    if (!workflow || !workflow.enabled) continue;
+
+    if (run.state === 'sleeping' && run.wakeAt && Date.parse(run.wakeAt) > Date.now()) {
+      chrome.alarms.create(`${RUN_ALARM_PREFIX}${run.runId}`, { when: Date.parse(run.wakeAt) });
+      continue;
+    }
+
+    await resumeWorkflow(workflow, run.runId);
+  }
+}
+
 async function handleAlarm(name: string): Promise<void> {
-  if (!name.startsWith('agent:')) return;
-  await runAgentNow(name.slice('agent:'.length));
+  if (name.startsWith(AGENT_ALARM_PREFIX)) {
+    await runAgentNow(name.slice(AGENT_ALARM_PREFIX.length));
+    return;
+  }
+
+  if (name.startsWith(RUN_ALARM_PREFIX)) {
+    const runId = name.slice(RUN_ALARM_PREFIX.length);
+    const run = await getRunRecord(runId);
+    if (!run) return;
+    const workflow = (await getWorkflows()).find((candidate) => candidate.id === run.workflowId);
+    if (!workflow || !workflow.enabled) return;
+    await resumeWorkflow(workflow, runId);
+  }
 }
 
 async function runAgentNow(agentId: string, prompt?: string): Promise<void> {
@@ -74,4 +154,17 @@ async function runWorkflowNow(workflowId: string): Promise<void> {
   const workflow = (await getWorkflows()).find((candidate) => candidate.id === workflowId);
   if (!workflow || !workflow.enabled) return;
   await runWorkflow(workflow);
+}
+
+async function reconcileRunNow(runId: string, resolution: ReconciliationResolution): Promise<void> {
+  const run = await getRunRecord(runId);
+  if (!run) throw new Error(`Run '${runId}' was not found.`);
+  const workflow = (await getWorkflows()).find((candidate) => candidate.id === run.workflowId);
+  if (!workflow) throw new Error(`Workflow '${run.workflowId}' was not found.`);
+  if (!workflow.enabled) throw new Error(`Workflow '${workflow.name}' is disabled.`);
+  await reconcileWorkflowRun(workflow, runId, resolution);
+}
+
+function isReconciliationResolution(value: string | undefined): value is ReconciliationResolution {
+  return typeof value === 'string' && RECONCILIATION_RESOLUTIONS.has(value as ReconciliationResolution);
 }
