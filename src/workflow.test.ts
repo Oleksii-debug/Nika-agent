@@ -33,7 +33,7 @@ vi.mock('./run-store', () => ({
   saveRunRecord: mocks.saveRunRecord,
 }));
 
-import { interpolate, resumeWorkflow, runWorkflow } from './workflow';
+import { interpolate, reconcileWorkflowRun, resumeWorkflow, runWorkflow } from './workflow';
 
 const savedRuns: RunRecord[] = [];
 
@@ -148,6 +148,68 @@ describe('runWorkflow', () => {
     expect(mocks.sendToAgent).not.toHaveBeenCalled();
     expect(interrupted.state).toBe('needs_reconciliation');
     expect(savedRuns.at(-1)?.state).toBe('needs_reconciliation');
+  });
+});
+
+describe('reconcileWorkflowRun', () => {
+  const workflow: WorkflowDefinition = {
+    id: 'workflow',
+    projectId: 'project',
+    name: 'Recover send',
+    enabled: true,
+    steps: [{ id: 'send-1', type: 'send', agentId: agent.id, prompt: 'Implement feature' }],
+  };
+
+  it('can assume an ambiguous send completed without replaying it', async () => {
+    const interrupted = makeRun({
+      state: 'needs_reconciliation',
+      stepState: 'executing',
+      currentStepId: 'send-1',
+      targetChatId: agent.id,
+      error: 'ambiguous send',
+    });
+    mocks.getRunRecord.mockResolvedValue(interrupted);
+
+    await reconcileWorkflowRun(workflow, interrupted.runId, 'assume_completed');
+
+    expect(mocks.sendToAgent).not.toHaveBeenCalled();
+    expect(interrupted.currentStepIndex).toBe(1);
+    expect(interrupted.state).toBe('completed');
+    expect(savedRuns.some((run) => run.state === 'queued' && run.currentStepIndex === 1)).toBe(true);
+    expect(savedRuns.at(-1)?.state).toBe('completed');
+  });
+
+  it('replays an ambiguous send only after an explicit retry authorization', async () => {
+    const interrupted = makeRun({
+      state: 'needs_reconciliation',
+      stepState: 'executing',
+      currentStepId: 'send-1',
+      targetChatId: agent.id,
+      error: 'ambiguous send',
+    });
+    mocks.getRunRecord.mockResolvedValue(interrupted);
+
+    await reconcileWorkflowRun(workflow, interrupted.runId, 'retry');
+
+    expect(mocks.sendToAgent).toHaveBeenCalledTimes(1);
+    expect(interrupted.state).toBe('completed');
+    expect(savedRuns.some((run) => run.state === 'queued' && run.stepState === 'pending')).toBe(true);
+  });
+
+  it('can terminate an ambiguous run without replaying the side effect', async () => {
+    const interrupted = makeRun({
+      state: 'needs_reconciliation',
+      stepState: 'executing',
+      currentStepId: 'send-1',
+      targetChatId: agent.id,
+    });
+    mocks.getRunRecord.mockResolvedValue(interrupted);
+
+    await reconcileWorkflowRun(workflow, interrupted.runId, 'fail');
+
+    expect(mocks.sendToAgent).not.toHaveBeenCalled();
+    expect(interrupted.state).toBe('failed');
+    expect(savedRuns.at(-1)?.state).toBe('failed');
   });
 });
 
