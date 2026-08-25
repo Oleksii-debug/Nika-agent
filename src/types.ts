@@ -107,7 +107,13 @@ export type EffectProofObservation = {
 
 export type ContentCommand =
   | { type: 'status' }
-  | { type: 'send'; prompt: string; promptHash?: string; baselineUserTurnCount?: number }
+  | {
+      type: 'send';
+      prompt: string;
+      promptHash?: string;
+      baselineUserTurnCount?: number;
+      expectedPageUrl?: string;
+    }
   | { type: 'verifyPrompt'; promptHash: string; baselineUserTurnCount: number }
   | { type: 'captureLatest' };
 
