@@ -62,10 +62,3 @@ export async function releaseTargetClaim(targetUrlOrAgentId: string, owner: Targ
 export async function getTargetClaim(targetUrlOrAgentId: string): Promise<DurableTargetClaim | undefined> {
   return db.targetClaims.get(await resolveTargetKey(targetUrlOrAgentId));
 }
-
-export async function releaseClaimsForOwner(ownerKind: TargetClaimOwnerKind, ownerId: string): Promise<void> {
-  await db.transaction('rw', db.targetClaims, async () => {
-    const claims = await db.targetClaims.where('[ownerKind+ownerId]').equals([ownerKind, ownerId]).toArray();
-    await db.targetClaims.bulkDelete(claims.map((claim) => claim.targetKey));
-  });
-}
