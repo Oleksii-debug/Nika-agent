@@ -35,6 +35,8 @@ vi.mock('./run-store', () => ({
 
 import { interpolate, resumeWorkflow, runWorkflow } from './workflow';
 
+const savedRuns: RunRecord[] = [];
+
 const agent: ChatAgent = {
   id: 'developer',
   projectId: 'project',
@@ -66,6 +68,7 @@ function makeRun(overrides: Partial<RunRecord> = {}): RunRecord {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  savedRuns.length = 0;
   mocks.getAgents.mockResolvedValue([agent]);
   mocks.appendLog.mockResolvedValue(undefined);
   mocks.sendToAgent.mockResolvedValue(undefined);
@@ -73,7 +76,9 @@ beforeEach(() => {
   mocks.captureAgentResponse.mockResolvedValue('captured response');
   mocks.acquireAgentLease.mockResolvedValue(true);
   mocks.releaseAgentLease.mockResolvedValue(undefined);
-  mocks.saveRunRecord.mockResolvedValue(undefined);
+  mocks.saveRunRecord.mockImplementation(async (record: RunRecord) => {
+    savedRuns.push(structuredClone(record));
+  });
   mocks.createRunRecord.mockResolvedValue(makeRun());
 });
 
@@ -107,9 +112,8 @@ describe('runWorkflow', () => {
     const dispatchOrder = mocks.saveRunRecord.mock.invocationCallOrder[0];
     const sendOrder = mocks.sendToAgent.mock.invocationCallOrder[0];
     expect(dispatchOrder).toBeLessThan(sendOrder);
-    const checkpoint = mocks.saveRunRecord.mock.calls[0]?.[0] as RunRecord;
-    expect(checkpoint.stepState).toBe('executing');
-    expect(checkpoint.currentStepId).toBe('send-1');
+    expect(savedRuns[0]?.stepState).toBe('executing');
+    expect(savedRuns[0]?.currentStepId).toBe('send-1');
   });
 
   it('passes a stable run id and step id into side-effecting runtime calls', async () => {
@@ -143,7 +147,7 @@ describe('runWorkflow', () => {
 
     expect(mocks.sendToAgent).not.toHaveBeenCalled();
     expect(interrupted.state).toBe('needs_reconciliation');
-    expect(mocks.saveRunRecord).toHaveBeenCalledWith(interrupted);
+    expect(savedRuns.at(-1)?.state).toBe('needs_reconciliation');
   });
 });
 
