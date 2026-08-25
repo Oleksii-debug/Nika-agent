@@ -13,7 +13,7 @@ The strongest new reuse opportunities are narrower and more valuable:
 2. keep `dom-accessibility-api` as the small production primitive for accessible-name/description computation;
 3. treat WebDriver BiDi as the preferred future **server/browser-farm transport abstraction**, while keeping Chrome Extension DOM execution as the primary local runtime;
 4. keep CDP as a privileged compatibility/diagnostic escape hatch rather than the architecture-wide browser API;
-5. stop accumulating architecture research without closing the implementation gap: current `src/runtime.ts` still contains blind reload/retry for mutating commands, in-memory per-agent queues, and one-second idle polling.
+5. prioritize implementation over more framework discovery: the P0 SEND transport-safety work has now landed, but durable leases/effects, event-driven waits and semantic resolution are still not implemented.
 
 The resulting boundary is:
 
@@ -25,34 +25,36 @@ The resulting boundary is:
 
 ---
 
-## 1. Current implementation gap is now larger than the research gap
+## 1. Runtime gap audit after the latest merged P0 work
 
-The repository has accumulated a strong reliability model in research documents, but the current runtime still contains several prototype-era behaviors.
+A concurrent implementation worker merged commit `5bcdc83f0e2bc9093f3e0d3cd4ed8be8b71e6c21` while this research cycle was running. The audit below is therefore based on the post-merge `main`, not the earlier prototype.
 
-### 1.1 Mutating send still goes through generic reload/retry
+### 1.1 Blind SEND retry/reload is now fixed at transport level
 
-Current `src/runtime.ts::contentCommand()` retries every recoverable command. On the first messaging failure it reloads the tab and then retries the same command.
-
-That remains incompatible with the already accepted ambiguity-safe SEND contract.
-
-A message-channel failure after `send.click()` does not prove that the browser side effect failed. Therefore `SEND_MESSAGE` cannot share a generic retry wrapper with a read-only `status` operation.
-
-Required change:
+Current `src/runtime.ts` has an explicit `ContentCommandRetryPolicy`:
 
 ```text
-READ command
-  -> retry-safe policy allowed
-
-WRITE command before external effect
-  -> bounded retry only if NO_EFFECT is proven
-
-WRITE command after possible external effect
-  -> observe/reconcile
-  -> SETTLED_SUCCESS | NO_EFFECT | AMBIGUOUS
-  -> never blind resend
+send          -> none
+status        -> read_only
+captureLatest -> read_only
 ```
 
-The unconditional `chrome.tabs.reload()` is especially unsafe because it can destroy manually typed composer content.
+The old unconditional reload-and-retry path for `send` has been removed. A transport failure from SEND now surfaces as `SEND_UNCERTAIN` rather than causing automatic replay.
+
+This is an important P0 improvement and aligns with the ambiguity-sensitive side-effect model already established in research.
+
+However this is only the first half of the full SEND contract.
+
+Current success still means that the content command returned success. The runtime still needs the stronger state machine:
+
+```text
+PREPARE
+-> DISPATCH
+-> OBSERVE
+-> SETTLED_SUCCESS | NO_EFFECT | WRONG_EFFECT | BLOCKED | AMBIGUOUS
+```
+
+`SEND_UNCERTAIN` should eventually become a durable effect state with recovery/reconciliation evidence rather than only an exception string.
 
 ### 1.2 Per-agent serialization is currently memory-only
 
@@ -66,7 +68,7 @@ Therefore this implementation should be treated as a temporary `MutationGate` op
 
 ### 1.3 Idle detection is still service-worker polling
 
-`waitUntilIdle()` currently polls the content script every second and uses `sleep(1000)` until the settle window elapses.
+`waitUntilIdle()` still polls the content script every second and uses `sleep(1000)` until the settle window elapses.
 
 This contradicts the event-driven/durable-wait design already established in research.
 
@@ -165,11 +167,9 @@ That is not a reason to reject it. It is precisely why differential testing is v
 
 A mature oracle can still be wrong; Nika should fail closed when engines disagree on a mutating target rather than silently select a candidate.
 
-Suggested result:
+Suggested development/canary classification:
 
-`SEMANTIC_ORACLE_DISAGREEMENT`
-
-for selected development/canary checks.
+`SEMANTIC_ORACLE_DISAGREEMENT`.
 
 ---
 
@@ -223,7 +223,7 @@ Create a fixture suite covering at least:
 - React re-render replacing the underlying node;
 - wrappers added around the target;
 - duplicated Send-like controls;
-- locale change (`Send`, Ukrainian localized label, etc.);
+- locale change (`Send`, localized label, etc.);
 - dynamically changing accessible name;
 - target removed and recreated during resolution.
 
@@ -234,7 +234,7 @@ Create a fixture suite covering at least:
 - stale document after frame navigation;
 - same locator recipe across two navigation epochs.
 
-For every fixture:
+For every fixture record:
 
 ```text
 Nika resolver result
@@ -288,7 +288,7 @@ The local Nika use case is special:
 - cooperative human handoff;
 - browser-extension permissions;
 - direct DOM/content-script integration;
-- NVDA/operator Side Panel.
+- operator Side Panel.
 
 WebDriver BiDi normally belongs to an automation session controlled through a driver/browser transport. It does not automatically solve extension lifecycle, Side Panel control, existing-user-tab adoption or ChatGPT-specific semantic verification.
 
@@ -409,10 +409,10 @@ This is the cleanest way to prevent future server/browser-farm work from silentl
 
 The research is now mature enough that implementation should dominate the next cycles.
 
-Recommended order:
+Recommended order after the merged P0 SEND transport fix:
 
-1. Remove generic mutating-command retry/reload from `src/runtime.ts`.
-2. Introduce `EffectClass` / `RetryClass` in executable code.
+1. Preserve and regression-test `send -> retryPolicy:none` and `SEND_UNCERTAIN` semantics.
+2. Replace exception-only SEND uncertainty with a durable Effect record.
 3. Split SEND into `PREPARE -> DISPATCH -> OBSERVE -> SETTLE`.
 4. Introduce durable job/effect/lease schema (Dexie spike).
 5. Replace `waitUntilIdle()` polling with `WaitCondition` + content-script observer + durable reconciliation.
