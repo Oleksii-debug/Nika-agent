@@ -11,8 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "dexie": "^4.4.5",
-    "xstate": "^5.32.5"
+    "dexie": "^4.4.5"
   },
   "devDependencies": {
     "typescript": "^5.9.2",
