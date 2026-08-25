@@ -1,5 +1,5 @@
 import Dexie, { type Table } from 'dexie';
-import type { ChatBlockerKind, ChatState, WorkflowDefinition } from './types';
+import type { ChatBlockerKind, ChatState, EffectProofObservation, WorkflowDefinition } from './types';
 
 export type DurableJobState =
   | 'pending'
@@ -46,7 +46,10 @@ export type SendIntent = {
   prompt: string;
   promptHash: string;
   baselineUserTurnCount: number;
+  baselinePageUrl?: string;
+  baselineSelectorProfile?: string;
   state: SendIntentState;
+  effectProof?: EffectProofObservation;
   createdAt: string;
   updatedAt: string;
   confirmedAt?: string;
