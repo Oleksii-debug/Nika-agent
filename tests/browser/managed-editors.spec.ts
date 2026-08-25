@@ -74,11 +74,26 @@ async function contentCommand(worker: Worker, command: Record<string, unknown>):
   }, { url: 'https://chatgpt.com/*', command });
 }
 
+async function waitForContentScriptReady(worker: Worker): Promise<void> {
+  await expect.poll(async () => {
+    try {
+      const result = await contentCommand(worker, { type: 'status' });
+      return result.ok === true;
+    } catch {
+      return false;
+    }
+  }, {
+    timeout: 10_000,
+    message: 'ChatGPT content script did not become ready on the fixture tab',
+  }).toBe(true);
+}
+
 for (const editor of EDITORS) {
   test(`${editor.name}: verified multiline composer write reaches one-shot submit`, async () => {
     const { context, worker } = await launchExtension();
     try {
       const page = await openFixture(context, editor);
+      await waitForContentScriptReady(worker);
       const result = await contentCommand(worker, { type: 'send', prompt: PROMPT });
 
       expect(result.ok).toBe(true);
@@ -95,6 +110,7 @@ for (const editor of EDITORS) {
     const { context, worker } = await launchExtension();
     try {
       const page = await openFixture(context, editor, true);
+      await waitForContentScriptReady(worker);
       const result = await contentCommand(worker, { type: 'send', prompt: PROMPT });
 
       expect(result.ok).toBe(false);
