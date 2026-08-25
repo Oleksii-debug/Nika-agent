@@ -31,7 +31,7 @@ async function launchExtension(): Promise<{ context: BrowserContext; worker: Wor
   return { context, worker };
 }
 
-function fixtureHtml(editor: EditorFixture, rollback = false): string {
+function fixtureHtml(editor: EditorFixture, rollback = false, routeDrift = false): string {
   return `<!doctype html>
 <html><body>
   <main>
@@ -44,6 +44,7 @@ function fixtureHtml(editor: EditorFixture, rollback = false): string {
     const editor = document.querySelector('#prompt-textarea');
     const send = document.querySelector('[data-testid="send-button"]');
     ${rollback ? `editor.addEventListener('input', () => setTimeout(() => { editor.textContent = ''; }, 0));` : ''}
+    ${routeDrift ? `editor.addEventListener('input', () => setTimeout(() => { history.pushState({}, '', '/c/nika-other-fixture'); }, 0));` : ''}
     send.addEventListener('click', () => {
       const submittedText = editor.textContent || '';
       window.__nikaSubmitCount += 1;
@@ -83,10 +84,16 @@ async function waitForContentScriptReady(worker: Worker): Promise<void> {
   }).toBe(true);
 }
 
-async function openFixture(context: BrowserContext, worker: Worker, editor: EditorFixture, rollback = false): Promise<Page> {
+async function openFixture(
+  context: BrowserContext,
+  worker: Worker,
+  editor: EditorFixture,
+  rollback = false,
+  routeDrift = false,
+): Promise<Page> {
   const page = await context.newPage();
   await page.route('https://chatgpt.com/**', async (route) => {
-    await route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: fixtureHtml(editor, rollback) });
+    await route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: fixtureHtml(editor, rollback, routeDrift) });
   });
   await page.goto(CHAT_URL, { waitUntil: 'load' });
   await page.waitForSelector('#prompt-textarea');
@@ -99,7 +106,11 @@ for (const editor of EDITORS) {
     const { context, worker } = await launchExtension();
     try {
       const page = await openFixture(context, worker, editor);
-      const result = await contentCommand(worker, { type: 'send', prompt: PROMPT });
+      const result = await contentCommand(worker, {
+        type: 'send',
+        prompt: PROMPT,
+        expectedPageUrl: CHAT_URL,
+      });
 
       expect(result, `unexpected SEND result: ${JSON.stringify(result)}`).toMatchObject({ ok: true, sendStatus: 'confirmed' });
       await expect.poll(() => page.evaluate(() => (window as typeof window & { __nikaSubmitCount?: number }).__nikaSubmitCount)).toBe(1);
@@ -114,10 +125,33 @@ for (const editor of EDITORS) {
     const { context, worker } = await launchExtension();
     try {
       const page = await openFixture(context, worker, editor, true);
-      const result = await contentCommand(worker, { type: 'send', prompt: PROMPT });
+      const result = await contentCommand(worker, {
+        type: 'send',
+        prompt: PROMPT,
+        expectedPageUrl: CHAT_URL,
+      });
 
       expect(result.ok, `unexpected rollback SEND result: ${JSON.stringify(result)}`).toBe(false);
       expect(String(result.error)).toContain('COMPOSER_WRITE_UNVERIFIED: EDITOR_REVERTED');
+      expect(await page.evaluate(() => (window as typeof window & { __nikaSubmitCount?: number }).__nikaSubmitCount)).toBe(0);
+      await expect(page.locator('[data-message-author-role="user"]')).toHaveCount(0);
+    } finally {
+      await context.close();
+    }
+  });
+
+  test(`${editor.name}: SPA route drift after write blocks irreversible submit`, async () => {
+    const { context, worker } = await launchExtension();
+    try {
+      const page = await openFixture(context, worker, editor, false, true);
+      const result = await contentCommand(worker, {
+        type: 'send',
+        prompt: PROMPT,
+        expectedPageUrl: CHAT_URL,
+      });
+
+      expect(result.ok, `unexpected route-drift SEND result: ${JSON.stringify(result)}`).toBe(false);
+      expect(String(result.error)).toContain('ROUTE_IDENTITY_MISMATCH');
       expect(await page.evaluate(() => (window as typeof window & { __nikaSubmitCount?: number }).__nikaSubmitCount)).toBe(0);
       await expect(page.locator('[data-message-author-role="user"]')).toHaveCount(0);
     } finally {
