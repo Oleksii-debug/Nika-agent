@@ -1,4 +1,5 @@
 import { db, type SendIntent } from './db';
+import type { EffectProofObservation } from './types';
 
 export class SendIntentOwnershipError extends Error {
   readonly jobId: string;
@@ -16,6 +17,8 @@ export async function getOrCreateSendIntent(input: {
   runId?: string;
   prompt: string;
   baselineUserTurnCount: number;
+  baselinePageUrl?: string;
+  baselineSelectorProfile?: string;
 }): Promise<SendIntent> {
   const promptHash = await hashPrompt(input.prompt);
 
@@ -54,6 +57,35 @@ export async function setSendIntentState(
   await db.sendIntents.put(intent);
 }
 
+export async function settleSendIntentEffectProof(
+  id: string,
+  proof: EffectProofObservation,
+): Promise<SendIntent['state']> {
+  return db.transaction('rw', db.sendIntents, async () => {
+    const intent = await db.sendIntents.get(id);
+    if (!intent) throw new Error(`SEND_INTENT_MISSING: ${id}`);
+
+    const timestamp = new Date().toISOString();
+    intent.effectProof = proof;
+    intent.updatedAt = timestamp;
+    intent.detail = proof.detail;
+
+    if (proof.outcome === 'confirmed') {
+      intent.state = 'confirmed';
+      intent.confirmedAt = timestamp;
+    } else if (proof.outcome === 'no_effect') {
+      intent.state = 'absent';
+      delete intent.confirmedAt;
+    } else {
+      intent.state = 'ambiguous';
+      delete intent.confirmedAt;
+    }
+
+    await db.sendIntents.put(intent);
+    return intent.state;
+  });
+}
+
 export async function getSendIntentForJob(jobId: string): Promise<SendIntent | undefined> {
   return db.sendIntents.where('jobId').equals(jobId).first();
 }
@@ -72,6 +104,8 @@ function createIntent(
     runId?: string;
     prompt: string;
     baselineUserTurnCount: number;
+    baselinePageUrl?: string;
+    baselineSelectorProfile?: string;
   },
   promptHash: string,
 ): SendIntent {
@@ -88,6 +122,8 @@ function createIntent(
   };
   if (input.jobId !== undefined) intent.jobId = input.jobId;
   if (input.runId !== undefined) intent.runId = input.runId;
+  if (input.baselinePageUrl !== undefined) intent.baselinePageUrl = input.baselinePageUrl;
+  if (input.baselineSelectorProfile !== undefined) intent.baselineSelectorProfile = input.baselineSelectorProfile;
   return intent;
 }
 
@@ -99,6 +135,8 @@ function assertIntentOwnership(
     runId?: string;
     prompt: string;
     baselineUserTurnCount: number;
+    baselinePageUrl?: string;
+    baselineSelectorProfile?: string;
   },
   promptHash: string,
 ): void {
@@ -116,5 +154,15 @@ function assertIntentOwnership(
       jobId,
       `run changed from '${existing.runId ?? 'missing'}' to '${input.runId}'`,
     );
+  }
+  if (existing.baselinePageUrl && input.baselinePageUrl && existing.baselinePageUrl !== input.baselinePageUrl) {
+    throw new SendIntentOwnershipError(jobId, 'conversation target changed after durable intent creation');
+  }
+  if (
+    existing.baselineSelectorProfile
+    && input.baselineSelectorProfile
+    && existing.baselineSelectorProfile !== input.baselineSelectorProfile
+  ) {
+    throw new SendIntentOwnershipError(jobId, 'selector profile changed after durable intent creation');
   }
 }
