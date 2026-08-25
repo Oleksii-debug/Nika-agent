@@ -4,7 +4,7 @@ export class SendIntentOwnershipError extends Error {
   readonly jobId: string;
 
   constructor(jobId: string, detail: string) {
-    super(`SEND_INTENT_OWNERSHIP_MISMATCH[${jobId}]: ${detail}`);
+    super(`SEND_UNCERTAIN: SEND_INTENT_OWNERSHIP_MISMATCH[${jobId}]: ${detail}`);
     this.name = 'SendIntentOwnershipError';
     this.jobId = jobId;
   }
