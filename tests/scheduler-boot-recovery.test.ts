@@ -5,6 +5,7 @@ import { claimNextDueJob, getRuntimeBootId, reclaimStaleLeases } from '../src/sc
 
 const NOW = new Date('2026-08-25T10:00:00.000Z');
 const FUTURE = new Date(NOW.getTime() + 60_000).toISOString();
+const PAST = new Date(NOW.getTime() - 60_000).toISOString();
 
 function job(id: string, overrides: Omit<Partial<DurableJob>, 'id'> = {}): DurableJob {
   return {
@@ -44,6 +45,28 @@ describe('MV3 worker-boot fenced job leases', () => {
       state: 'running',
       leaseBootId: getRuntimeBootId(),
       leaseUntil: FUTURE,
+    });
+  });
+
+  it('never reclaims a same-boot running operation solely because its diagnostic TTL elapsed', async () => {
+    await db.jobs.bulkPut([
+      job('running-long', {
+        state: 'running',
+        leaseOwner: 'worker-long',
+        leaseBootId: getRuntimeBootId(),
+        leaseUntil: PAST,
+        runId: 'run-long',
+      }),
+      job('pending-behind-long'),
+    ]);
+
+    expect(await reclaimStaleLeases(NOW)).toBe(0);
+    expect(await claimNextDueJob(NOW)).toBeUndefined();
+    expect(await db.jobs.get('running-long')).toMatchObject({
+      state: 'running',
+      leaseOwner: 'worker-long',
+      leaseBootId: getRuntimeBootId(),
+      leaseUntil: PAST,
     });
   });
 
