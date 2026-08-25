@@ -1,7 +1,8 @@
 import type { ChatAgent, ChatState, ContentCommand, ContentResult, RunSource, StateEvidence } from './types';
 import type { SendIntent } from './db';
 import { appendLog } from './storage';
-import { getOrCreateSendIntent, setSendIntentState } from './send-intents';
+import { evaluateSendEffectProof } from './effect-proof';
+import { getOrCreateSendIntent, setSendIntentState, settleSendIntentEffectProof } from './send-intents';
 
 const agentQueues = new Map<string, Promise<void>>();
 const HARD_BLOCKED_STATES = new Set<ChatState>(['blocked', 'logged_out', 'rate_limited', 'verification_required', 'unsupported']);
@@ -72,13 +73,15 @@ export async function sendToAgent(
     };
     if (context.jobId !== undefined) intentInput.jobId = context.jobId;
     if (context.runId !== undefined) intentInput.runId = context.runId;
+    if (status.evidence.pageUrl !== undefined) intentInput.baselinePageUrl = status.evidence.pageUrl;
+    if (status.evidence.selectorProfile !== undefined) intentInput.baselineSelectorProfile = status.evidence.selectorProfile;
     const intent = await getOrCreateSendIntent(intentInput);
 
     if (intent.state === 'confirmed') return;
     if (intent.state === 'dispatching' || intent.state === 'ambiguous') {
       const presence = await reconcileSendIntentUnlocked(agent, intent);
       if (presence === 'confirmed') return;
-      if (presence === 'ambiguous') throw new Error('SEND_AMBIGUOUS: persisted send intent cannot be uniquely reconciled.');
+      if (presence === 'ambiguous') throw new Error('SEND_AMBIGUOUS: persisted send intent cannot be causally reconciled.');
     }
 
     await setSendIntentState(intent.id, 'dispatching');
@@ -91,15 +94,24 @@ export async function sendToAgent(
 
     if (!result.ok) {
       if (result.evidence && HARD_BLOCKED_STATES.has(result.evidence.state)) throw blockedError(agent.id, result.evidence);
+      const reconciled = await reconcileSendIntentUnlocked(agent, intent);
+      if (reconciled === 'confirmed') {
+        await appendLog({ agentId: agent.id, ...context, level: 'info', event: 'prompt_sent', detail: prompt.slice(0, 500) });
+        return;
+      }
+      if (reconciled === 'ambiguous') throw new Error(`SEND_AMBIGUOUS: ${result.error}`);
       throw new Error(result.error);
     }
-    if (result.sendStatus !== 'confirmed') {
-      await setSendIntentState(intent.id, 'ambiguous', result.detail ?? 'DOM submit occurred but user-turn confirmation was not unique.');
-      throw new Error('SEND_AMBIGUOUS: prompt submission was not confirmed by a unique new user turn.');
-    }
 
-    await setSendIntentState(intent.id, 'confirmed');
-    await appendLog({ agentId: agent.id, ...context, level: 'info', event: 'prompt_sent', detail: prompt.slice(0, 500) });
+    const settled = await settleResultWithFreshObservation(tabId, intent, result);
+    if (settled === 'confirmed') {
+      await appendLog({ agentId: agent.id, ...context, level: 'info', event: 'prompt_sent', detail: prompt.slice(0, 500) });
+      return;
+    }
+    if (settled === 'absent') {
+      throw new Error('SEND_NO_EFFECT: one-shot dispatch produced no observable user turn; durable retry is permitted.');
+    }
+    throw new Error('SEND_AMBIGUOUS: one-shot dispatch changed the surface without a unique causal proof.');
   });
 }
 
@@ -114,13 +126,47 @@ async function reconcileSendIntentUnlocked(agent: ChatAgent, intent: SendIntent)
     promptHash: intent.promptHash,
     baselineUserTurnCount: intent.baselineUserTurnCount,
   }, { recover: true });
-  if (!result.ok || !result.presence) {
-    if (!result.ok && result.evidence && HARD_BLOCKED_STATES.has(result.evidence.state)) throw blockedError(agent.id, result.evidence);
-    await setSendIntentState(intent.id, 'ambiguous', result.ok ? 'Prompt presence result missing.' : result.error);
+  if (!result.ok) {
+    if (result.evidence && HARD_BLOCKED_STATES.has(result.evidence.state)) throw blockedError(agent.id, result.evidence);
+    await setSendIntentState(intent.id, 'ambiguous', result.error);
     return 'ambiguous';
   }
-  await setSendIntentState(intent.id, result.presence, result.detail);
-  return result.presence;
+  return settleResultWithFreshObservation(tabId, intent, result);
+}
+
+async function settleResultWithFreshObservation(
+  tabId: number,
+  intent: SendIntent,
+  result: Extract<ContentResult, { ok: true }>,
+): Promise<'confirmed' | 'absent' | 'ambiguous'> {
+  const observation = await contentCommand(tabId, { type: 'status' }, { recover: true });
+  if (!observation.ok || !observation.evidence) {
+    await setSendIntentState(
+      intent.id,
+      'ambiguous',
+      observation.ok ? 'Fresh post-dispatch state evidence is unavailable.' : observation.error,
+    );
+    return 'ambiguous';
+  }
+
+  if (
+    intent.baselineSelectorProfile
+    && observation.evidence.selectorProfile
+    && intent.baselineSelectorProfile !== observation.evidence.selectorProfile
+  ) {
+    await setSendIntentState(intent.id, 'ambiguous', 'Selector profile changed between baseline and effect observation.');
+    return 'ambiguous';
+  }
+
+  const proof = evaluateSendEffectProof({
+    baselinePageUrl: intent.baselinePageUrl,
+    observedPageUrl: observation.evidence.pageUrl,
+    baselineUserTurnCount: intent.baselineUserTurnCount,
+    observedUserTurnCount: observation.evidence.userTurnCount,
+    matches: result.matches ?? 0,
+  });
+  const state = await settleSendIntentEffectProof(intent.id, proof);
+  return state === 'confirmed' ? 'confirmed' : state === 'absent' ? 'absent' : 'ambiguous';
 }
 
 export async function inspectAgentState(agent: ChatAgent): Promise<StateEvidence> {
