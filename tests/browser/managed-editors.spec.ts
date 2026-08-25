@@ -35,7 +35,7 @@ function fixtureHtml(editor: EditorFixture, rollback = false, routeDrift = false
   return `<!doctype html>
 <html><body>
   <main>
-    <div id="prompt-textarea" contenteditable="true" ${editor.attributes}></div>
+    <div id="prompt-textarea" contenteditable="true" style="white-space: pre-wrap" ${editor.attributes}></div>
     <button data-testid="send-button" type="button">Send</button>
     <div id="turns"></div>
   </main>
