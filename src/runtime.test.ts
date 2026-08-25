@@ -4,7 +4,7 @@ import type { ChatAgent, ContentCommand, ContentResult } from './types';
 const appendLog = vi.hoisted(() => vi.fn());
 vi.mock('./storage', () => ({ appendLog }));
 
-import { sendToAgent } from './runtime';
+import { retryPolicyForContentCommand, sendToAgent } from './runtime';
 
 const agent: ChatAgent = {
   id: 'developer',
@@ -22,6 +22,14 @@ const agent: ChatAgent = {
 beforeEach(() => {
   vi.clearAllMocks();
   appendLog.mockResolvedValue(undefined);
+});
+
+describe('content command retry policy', () => {
+  it('never retries irreversible send while keeping bounded retry for read-only commands', () => {
+    expect(retryPolicyForContentCommand({ type: 'send', prompt: 'once' })).toBe('none');
+    expect(retryPolicyForContentCommand({ type: 'status' })).toBe('read_only');
+    expect(retryPolicyForContentCommand({ type: 'captureLatest' })).toBe('read_only');
+  });
 });
 
 describe('agent execution queue', () => {
