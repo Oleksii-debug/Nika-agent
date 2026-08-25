@@ -26,10 +26,14 @@ async function launchExtension(): Promise<{ context: BrowserContext; worker: Wor
 }
 
 async function bootIdentity(worker: Worker): Promise<{ token: string; timeOrigin: number }> {
-  return worker.evaluate(() => ({
-    token: crypto.randomUUID(),
-    timeOrigin: performance.timeOrigin,
-  }));
+  return worker.evaluate(() => {
+    const scope = globalThis as typeof globalThis & { __nikaLifecycleBootId?: string };
+    scope.__nikaLifecycleBootId ??= crypto.randomUUID();
+    return {
+      token: scope.__nikaLifecycleBootId,
+      timeOrigin: performance.timeOrigin,
+    };
+  });
 }
 
 async function terminateBackgroundWorker(context: BrowserContext, worker: Worker): Promise<void> {
@@ -75,6 +79,7 @@ test('MV3 runtime restart produces a distinct worker boot before recovery work c
   const { context, worker, extensionId } = await launchExtension();
   try {
     const firstBoot = await bootIdentity(worker);
+    expect((await bootIdentity(worker)).token).toBe(firstBoot.token);
 
     // Kill only the current service-worker target. Unlike chrome.runtime.reload(), this keeps
     // the extension and Playwright BrowserContext alive while ending the in-memory MV3 worker
@@ -89,6 +94,7 @@ test('MV3 runtime restart produces a distinct worker boot before recovery work c
     expect(restartedWorker.url()).toBe(worker.url());
     expect(secondBoot.timeOrigin).toBeGreaterThanOrEqual(firstBoot.timeOrigin);
     expect(secondBoot.token).not.toBe(firstBoot.token);
+    expect((await bootIdentity(restartedWorker)).token).toBe(secondBoot.token);
 
     // The restarted worker must be capable of servicing Chrome APIs, proving this is not
     // merely a stale Playwright Worker wrapper after termination.
