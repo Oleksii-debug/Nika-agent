@@ -22,6 +22,7 @@ export type DurableJob = {
   attempt: number;
   maxAttempts: number;
   leaseOwner?: string;
+  leaseBootId?: string;
   leaseUntil?: string;
   runId?: string;
   lastError?: string;
