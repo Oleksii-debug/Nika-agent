@@ -1,4 +1,12 @@
 import { classifyChatSurface } from '../src/chatgpt-state';
+import {
+  buildTextWriteEvidence,
+  detectEditorKind,
+  readEditorText,
+  verifyStableTextWrite,
+  type TextWriteEvidence,
+  type TextWriteStrategy,
+} from '../src/text-input';
 import type { ContentCommand, ContentResult, PromptPresenceResult, StateEvidence } from '../src/types';
 
 export default defineContentScript({
@@ -111,6 +119,7 @@ const LOGIN_TEXT_PATTERNS = [
 ];
 
 const IDLE_CANDIDATE_DEBOUNCE_MS = 3_000;
+const COMPOSER_STABILITY_WINDOW_MS = 120;
 let lastRelevantMutationAt = Date.now();
 let idleCandidateTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -255,32 +264,63 @@ function inspectState(): StateEvidence {
   return evidence;
 }
 
-function setComposerText(prompt: string): boolean {
+async function setComposerText(prompt: string): Promise<TextWriteEvidence | null> {
   const editor = firstElement<HTMLElement>(SELECTORS.composer);
-  if (!editor) return false;
+  if (!editor) return null;
 
+  const editorKind = detectEditorKind(editor);
+  let strategy: TextWriteStrategy;
   editor.focus({ preventScroll: true });
+
   if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
+    strategy = 'NATIVE_VALUE_SETTER';
     const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(editor), 'value');
     descriptor?.set?.call(editor, prompt);
     editor.dispatchEvent(new Event('input', { bubbles: true }));
     editor.dispatchEvent(new Event('change', { bubbles: true }));
-    return editor.value === prompt;
+  } else {
+    strategy = 'DOM_CONTENT_REPLACEMENT';
+    editor.textContent = prompt;
+    editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
   }
 
-  editor.textContent = prompt;
-  editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
-  return normalizeText(editor.innerText || editor.textContent || '') === normalizeText(prompt);
+  return buildTextWriteEvidence(prompt, readEditorText(editor), editorKind, strategy);
 }
 
 async function sendPrompt(prompt: string, promptHash?: string, baselineUserTurnCount?: number): Promise<ContentResult> {
   const evidence = inspectState();
   if (evidence.state !== 'idle') return { ok: false, error: describeUnsafeState(evidence), evidence };
-  if (!setComposerText(prompt)) return { ok: false, error: 'Composer not found or text insertion was not acknowledged.', evidence };
+
+  const writeEvidence = await setComposerText(prompt);
+  if (!writeEvidence) return { ok: false, error: 'Composer not found before text write.', evidence };
+  if (writeEvidence.outcome !== 'VERIFIED') {
+    return {
+      ok: false,
+      error: `COMPOSER_WRITE_UNVERIFIED: ${writeEvidence.outcome}. Submit was not attempted.`,
+      evidence,
+    };
+  }
 
   const baseline = baselineUserTurnCount ?? evidence.userTurnCount;
   const expectedHash = promptHash ?? (await hashText(prompt));
-  await sleep(120);
+  await sleep(COMPOSER_STABILITY_WINDOW_MS);
+
+  const stableEditor = firstElement<HTMLElement>(SELECTORS.composer);
+  if (!stableEditor) return { ok: false, error: 'Composer disappeared before verified submit.', evidence };
+  const stableWriteEvidence = await verifyStableTextWrite(
+    prompt,
+    writeEvidence.observedText ?? '',
+    readEditorText(stableEditor),
+    writeEvidence.editorKind,
+    writeEvidence.strategy,
+  );
+  if (stableWriteEvidence.outcome !== 'VERIFIED') {
+    return {
+      ok: false,
+      error: `COMPOSER_WRITE_UNVERIFIED: ${stableWriteEvidence.outcome}. Submit was not attempted.${stableWriteEvidence.detail ? ` ${stableWriteEvidence.detail}` : ''}`,
+      evidence,
+    };
+  }
 
   const preSubmitEvidence = inspectState();
   if (preSubmitEvidence.state !== 'idle') {
