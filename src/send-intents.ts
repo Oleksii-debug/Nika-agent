@@ -68,7 +68,8 @@ export async function settleSendIntentEffectProof(
     const timestamp = new Date().toISOString();
     intent.effectProof = proof;
     intent.updatedAt = timestamp;
-    intent.detail = proof.detail;
+    if (proof.detail === undefined) delete intent.detail;
+    else intent.detail = proof.detail;
 
     if (proof.outcome === 'confirmed') {
       intent.state = 'confirmed';
