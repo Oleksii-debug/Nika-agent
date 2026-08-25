@@ -39,28 +39,94 @@ export interface WorkflowDefinition {
   steps: WorkflowStep[];
 }
 
-export interface ExecutionProvenance {
-  runId?: string;
-  stepId?: string;
-}
+export type RunSource = 'manual' | 'scheduled' | 'workflow';
 
 export interface ExecutionLog {
   id: string;
   timestamp: string;
-  agentId?: string;
-  workflowId?: string;
-  runId?: string;
-  stepId?: string;
+  agentId?: string | undefined;
+  workflowId?: string | undefined;
+  runId?: string | undefined;
+  stepId?: string | undefined;
+  source?: RunSource | undefined;
   level: 'info' | 'warning' | 'error';
   event: string;
-  detail?: string;
+  detail?: string | undefined;
 }
+
+export type ChatState =
+  | 'idle'
+  | 'generating'
+  | 'blocked'
+  | 'logged_out'
+  | 'rate_limited'
+  | 'verification_required'
+  | 'navigation_pending'
+  | 'unsupported'
+  | 'unknown';
+
+export type ChatBlockerKind = 'login' | 'rate_limit' | 'verification' | 'access' | 'page_error';
+
+export type StateEvidence = {
+  state: ChatState;
+  composerPresent: boolean;
+  composerEditable: boolean;
+  sendControlPresent: boolean;
+  stopControlPresent: boolean;
+  assistantTurnCount: number;
+  userTurnCount: number;
+  latestAssistantText?: string;
+  latestUserText?: string;
+  mutationAgeMs?: number;
+  visibleError?: string;
+  blockerKind?: ChatBlockerKind;
+  selectorProfile?: string;
+  pageUrl?: string;
+  confidence: 'high' | 'medium' | 'low';
+};
+
+export type PromptPresenceResult = {
+  presence: 'confirmed' | 'absent' | 'ambiguous';
+  matches: number;
+  userTurnCount: number;
+  detail?: string;
+};
+
+export type EffectProofOutcome = 'confirmed' | 'no_effect' | 'ambiguous';
+
+export type EffectProofObservation = {
+  outcome: EffectProofOutcome;
+  baselinePageUrl?: string;
+  observedPageUrl?: string;
+  baselineUserTurnCount: number;
+  observedUserTurnCount: number;
+  matches: number;
+  observedAt: string;
+  detail?: string;
+};
 
 export type ContentCommand =
   | { type: 'status' }
-  | { type: 'send'; prompt: string }
+  | {
+      type: 'send';
+      prompt: string;
+      promptHash?: string;
+      baselineUserTurnCount?: number;
+      expectedPageUrl?: string;
+    }
+  | { type: 'verifyPrompt'; promptHash: string; baselineUserTurnCount: number }
   | { type: 'captureLatest' };
 
 export type ContentResult =
-  | { ok: true; state?: 'generating' | 'idle'; text?: string }
-  | { ok: false; error: string };
+  | {
+      ok: true;
+      state?: ChatState;
+      evidence?: StateEvidence;
+      text?: string;
+      sendStatus?: 'confirmed' | 'ambiguous';
+      userTurnCount?: number;
+      presence?: PromptPresenceResult['presence'];
+      matches?: number;
+      detail?: string;
+    }
+  | { ok: false; error: string; evidence?: StateEvidence };

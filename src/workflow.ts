@@ -1,73 +1,258 @@
+import { getActiveAgentQuarantine, quarantineAgent } from './chat-quarantine';
 import { appendLog, getAgents } from './storage';
-import { captureAgentResponse, sendToAgent, waitForAgentIdle } from './runtime';
-import type { ChatAgent, WorkflowDefinition } from './types';
+import { captureAgentResponse, ChatSurfaceBlockedError, inspectAgentState, isStablyIdle, sendToAgent } from './runtime';
+import { getSendIntentForJob } from './send-intents';
+import { acquireTargetClaim, releaseTargetClaim, type TargetClaimOwner } from './target-claims';
+import {
+  checkpointStepCompleted,
+  checkpointStepStarted,
+  checkpointWorkflowWait,
+  clearWorkflowWait,
+  completeWorkflowRun,
+  createWorkflowRun,
+  failWorkflowRun,
+  getWorkflowOutputs,
+  getWorkflowRun,
+  putWorkflowOutput,
+  verifyWorkflowSnapshot,
+} from './workflow-state';
+import type { AgentQuarantine } from './db';
+import type { ChatAgent, RunSource, StateEvidence, WorkflowDefinition } from './types';
 
-export async function runWorkflow(workflow: WorkflowDefinition): Promise<void> {
-  const runId = crypto.randomUUID();
+const WAIT_IDLE_POLL_MS = 2_000;
+const TARGET_RETRY_MS = 5_000;
+
+export type WorkflowRunOptions = {
+  runId?: string;
+  source?: RunSource;
+};
+
+export type WorkflowRunResult = 'completed' | 'suspended';
+
+export async function runWorkflow(workflow: WorkflowDefinition, options: WorkflowRunOptions = {}): Promise<WorkflowRunResult> {
+  const source = options.source ?? 'workflow';
+  const durable = await createWorkflowRun(workflow, source, options.runId);
+  const runId = durable.id;
+
+  if (!(await verifyWorkflowSnapshot(durable))) {
+    const error = new Error('WORKFLOW_REVISION_INVALID: durable workflow snapshot is missing or does not match its revision hash.');
+    await failWorkflowRun(runId, error, true);
+    await appendLog({ workflowId: durable.workflowId, runId, source: durable.source, level: 'error', event: 'workflow_revision_invalid', detail: error.message });
+    throw error;
+  }
+
+  const pinnedWorkflow = durable.workflowSnapshot;
   const agents = await getAgents();
   const byId = new Map(agents.map((agent) => [agent.id, agent]));
-  const context = new Map<string, string>();
+  const context = await getWorkflowOutputs(runId);
+  const persisted = await getWorkflowRun(runId);
+  let index = persisted?.nextStepIndex ?? 0;
 
-  await appendLog({ workflowId: workflow.id, runId, level: 'info', event: 'workflow_started' });
+  if (index === 0 && !persisted?.currentStepId) {
+    await appendLog({
+      workflowId: pinnedWorkflow.id,
+      runId,
+      source: durable.source,
+      level: 'info',
+      event: 'workflow_started',
+      detail: `revision:${durable.workflowRevision}`,
+    });
+  } else {
+    await appendLog({
+      workflowId: pinnedWorkflow.id,
+      runId,
+      source: durable.source,
+      level: 'warning',
+      event: 'workflow_resumed',
+      detail: `revision:${durable.workflowRevision};step:${index}`,
+    });
+  }
 
   try {
-    for (const step of workflow.steps) {
-      const provenance = { runId, stepId: step.id };
-      await appendLog({
-        workflowId: workflow.id,
-        ...provenance,
-        level: 'info',
-        event: 'workflow_step_started',
-        detail: step.type,
-      });
+    for (; index < pinnedWorkflow.steps.length; index += 1) {
+      const step = pinnedWorkflow.steps[index];
+      if (!step) throw new Error(`WORKFLOW_STEP_MISSING: pinned step index ${index} does not exist.`);
+      const runtimeContext = { workflowId: pinnedWorkflow.id, runId, stepId: step.id, source: durable.source } as const;
+      const current = await getWorkflowRun(runId);
+      let resumeAt = current?.currentStepId === step.id ? current.resumeAt : undefined;
+      let waitDeadlineAt = current?.currentStepId === step.id ? current.waitDeadlineAt : undefined;
+
+      if (!current?.currentStepId) {
+        if (step.type === 'delay') resumeAt = new Date(Date.now() + Math.max(0, step.milliseconds)).toISOString();
+        if (step.type === 'wait_idle') waitDeadlineAt = new Date(Date.now() + Math.max(1_000, step.timeoutMs)).toISOString();
+        await checkpointStepStarted(runId, step.id, resumeAt, waitDeadlineAt);
+        await appendLog({ ...runtimeContext, level: 'info', event: 'workflow_step_started', detail: step.type });
+      } else if (current.currentStepId !== step.id) {
+        throw new Error(`WORKFLOW_CHECKPOINT_MISMATCH: persisted step '${current.currentStepId}' does not match pinned step '${step.id}'.`);
+      }
 
       switch (step.type) {
         case 'send': {
           const agent = requireAgent(byId, step.agentId);
-          await sendToAgent(agent, interpolate(step.prompt, context), provenance);
+          if (await suspendForExistingQuarantine(runId, agent, runtimeContext)) return 'suspended';
+          const sendKey = workflowSendKey(runId, step.id);
+          const owner = workflowTargetOwner(runId, step.id);
+          if (!(await acquireTargetClaim(agent.id, owner))) {
+            const wakeAt = new Date(Date.now() + TARGET_RETRY_MS).toISOString();
+            await checkpointWorkflowWait(runId, 'target', wakeAt);
+            await appendLog({ agentId: agent.id, ...runtimeContext, level: 'info', event: 'workflow_target_suspended', detail: `wakeAt:${wakeAt}` });
+            return 'suspended';
+          }
+          await clearWorkflowWait(runId);
+          try {
+            await sendToAgent(agent, interpolate(step.prompt, context), { ...runtimeContext, jobId: sendKey });
+            await releaseTargetClaim(agent.id, owner);
+          } catch (error) {
+            await releaseWorkflowClaimIfSafe(agent.id, owner, sendKey);
+            if (error instanceof ChatSurfaceBlockedError && await suspendForBlockedEvidence(runId, agent, error.evidence, runtimeContext)) return 'suspended';
+            throw error;
+          }
           break;
         }
         case 'wait_idle': {
           const agent = requireAgent(byId, step.agentId);
-          await waitForAgentIdle(agent, step.timeoutMs);
-          break;
+          if (await suspendForExistingQuarantine(runId, agent, runtimeContext)) return 'suspended';
+          const deadline = waitDeadlineAt ? Date.parse(waitDeadlineAt) : Date.now() + Math.max(1_000, step.timeoutMs);
+          if (!Number.isFinite(deadline)) throw new Error('WORKFLOW_WAIT_INVALID: persisted wait_idle deadline is invalid.');
+
+          const evidence = await inspectAgentState(agent);
+          if (await suspendForBlockedEvidence(runId, agent, evidence, runtimeContext)) return 'suspended';
+          if (isStablyIdle(evidence, agent.completion.settleMs)) {
+            await clearWorkflowWait(runId);
+            await appendLog({ agentId: agent.id, ...runtimeContext, level: 'info', event: 'agent_idle', detail: `state:${evidence.state}` });
+            break;
+          }
+
+          if (Date.now() >= deadline) throw new Error('Timed out waiting for ChatGPT to become stably idle.');
+          const mutationRemaining = evidence.state === 'idle'
+            ? Math.max(250, agent.completion.settleMs - (evidence.mutationAgeMs ?? 0))
+            : WAIT_IDLE_POLL_MS;
+          const nextWake = Math.min(deadline, Date.now() + Math.min(WAIT_IDLE_POLL_MS, mutationRemaining));
+          const wakeAt = new Date(nextWake).toISOString();
+          await checkpointWorkflowWait(runId, 'wait_idle', wakeAt, new Date(deadline).toISOString());
+          await appendLog({ agentId: agent.id, ...runtimeContext, level: 'info', event: 'workflow_wait_suspended', detail: `wait_idle;wakeAt:${wakeAt};state:${evidence.state}` });
+          return 'suspended';
         }
         case 'capture': {
           const agent = requireAgent(byId, step.agentId);
-          context.set(step.outputKey, await captureAgentResponse(agent, provenance));
+          if (await suspendForExistingQuarantine(runId, agent, runtimeContext)) return 'suspended';
+          const existing = context.get(step.outputKey);
+          if (!existing) {
+            try {
+              const captured = await captureAgentResponse(agent, runtimeContext);
+              await putWorkflowOutput(runId, step.outputKey, captured);
+              context.set(step.outputKey, captured);
+            } catch (error) {
+              if (error instanceof ChatSurfaceBlockedError && await suspendForBlockedEvidence(runId, agent, error.evidence, runtimeContext)) return 'suspended';
+              throw error;
+            }
+          }
           break;
         }
         case 'forward': {
           const agent = requireAgent(byId, step.agentId);
+          if (await suspendForExistingQuarantine(runId, agent, runtimeContext)) return 'suspended';
           const captured = context.get(step.fromKey);
           if (!captured) throw new Error(`Workflow output '${step.fromKey}' is not available.`);
-          await sendToAgent(agent, `${step.prefix ?? ''}${captured}`, provenance);
+          const sendKey = workflowSendKey(runId, step.id);
+          const owner = workflowTargetOwner(runId, step.id);
+          if (!(await acquireTargetClaim(agent.id, owner))) {
+            const wakeAt = new Date(Date.now() + TARGET_RETRY_MS).toISOString();
+            await checkpointWorkflowWait(runId, 'target', wakeAt);
+            await appendLog({ agentId: agent.id, ...runtimeContext, level: 'info', event: 'workflow_target_suspended', detail: `wakeAt:${wakeAt}` });
+            return 'suspended';
+          }
+          await clearWorkflowWait(runId);
+          try {
+            await sendToAgent(agent, `${step.prefix ?? ''}${captured}`, { ...runtimeContext, jobId: sendKey });
+            await releaseTargetClaim(agent.id, owner);
+          } catch (error) {
+            await releaseWorkflowClaimIfSafe(agent.id, owner, sendKey);
+            if (error instanceof ChatSurfaceBlockedError && await suspendForBlockedEvidence(runId, agent, error.evidence, runtimeContext)) return 'suspended';
+            throw error;
+          }
           break;
         }
-        case 'delay':
-          await sleep(step.milliseconds);
+        case 'delay': {
+          const target = resumeAt ? Date.parse(resumeAt) : Date.now();
+          if (!Number.isFinite(target)) throw new Error('WORKFLOW_WAIT_INVALID: persisted delay resume timestamp is invalid.');
+          if (target > Date.now()) {
+            const wakeAt = new Date(target).toISOString();
+            await checkpointWorkflowWait(runId, 'delay', wakeAt);
+            await appendLog({ ...runtimeContext, level: 'info', event: 'workflow_wait_suspended', detail: `delay;wakeAt:${wakeAt}` });
+            return 'suspended';
+          }
+          await clearWorkflowWait(runId);
           break;
+        }
       }
 
-      await appendLog({
-        workflowId: workflow.id,
-        ...provenance,
-        level: 'info',
-        event: 'workflow_step_completed',
-        detail: step.type,
-      });
+      await checkpointStepCompleted(runId, index + 1);
+      await appendLog({ ...runtimeContext, level: 'info', event: 'workflow_step_completed', detail: step.type });
     }
-    await appendLog({ workflowId: workflow.id, runId, level: 'info', event: 'workflow_completed' });
+
+    await completeWorkflowRun(runId);
+    await appendLog({ workflowId: pinnedWorkflow.id, runId, source: durable.source, level: 'info', event: 'workflow_completed', detail: `revision:${durable.workflowRevision}` });
+    return 'completed';
   } catch (error) {
-    await appendLog({
-      workflowId: workflow.id,
-      runId,
-      level: 'error',
-      event: 'workflow_failed',
-      detail: error instanceof Error ? error.message : String(error),
-    });
+    const message = error instanceof Error ? error.message : String(error);
+    const needsReview = message.includes('SEND_AMBIGUOUS') || message.includes('SEND_UNCERTAIN') || message.includes('WORKFLOW_CHECKPOINT_MISMATCH') || message.includes('WORKFLOW_REVISION_INVALID') || message.includes('WORKFLOW_WAIT_INVALID') || message.includes('WORKFLOW_STEP_MISSING');
+    await failWorkflowRun(runId, error, needsReview);
+    await appendLog({ workflowId: pinnedWorkflow.id, runId, source: durable.source, level: 'error', event: needsReview ? 'workflow_needs_review' : 'workflow_failed', detail: message });
     throw error;
   }
+}
+
+async function suspendForExistingQuarantine(
+  runId: string,
+  agent: ChatAgent,
+  context: { workflowId: string; runId: string; stepId: string; source: RunSource },
+): Promise<boolean> {
+  const quarantine = await getActiveAgentQuarantine(agent.id);
+  if (!quarantine) return false;
+  await persistWorkflowQuarantineWait(runId, agent, quarantine, context);
+  return true;
+}
+
+async function suspendForBlockedEvidence(
+  runId: string,
+  agent: ChatAgent,
+  evidence: StateEvidence,
+  context: { workflowId: string; runId: string; stepId: string; source: RunSource },
+): Promise<boolean> {
+  const quarantine = await quarantineAgent(agent.id, evidence);
+  if (!quarantine) return false;
+  await persistWorkflowQuarantineWait(runId, agent, quarantine, context);
+  return true;
+}
+
+async function persistWorkflowQuarantineWait(
+  runId: string,
+  agent: ChatAgent,
+  quarantine: AgentQuarantine,
+  context: { workflowId: string; runId: string; stepId: string; source: RunSource },
+): Promise<void> {
+  const wakeAt = quarantine.mode === 'cooldown' ? quarantine.resumeAt : undefined;
+  await checkpointWorkflowWait(runId, 'quarantine', wakeAt);
+  const detail = `blocker:${quarantine.blockerKind};mode:${quarantine.mode}${wakeAt ? `;wakeAt:${wakeAt}` : ''}`;
+  await appendLog({ agentId: agent.id, ...context, level: 'warning', event: 'workflow_quarantine_suspended', detail });
+}
+
+async function releaseWorkflowClaimIfSafe(agentId: string, owner: TargetClaimOwner, sendKey: string): Promise<void> {
+  const intent = await getSendIntentForJob(sendKey);
+  if (!intent || intent.state === 'persisted' || intent.state === 'absent' || intent.state === 'confirmed') {
+    await releaseTargetClaim(agentId, owner);
+    return;
+  }
+  throw new Error('SEND_UNCERTAIN: workflow target remains durably claimed until persisted send intent is reconciled.');
+}
+
+function workflowSendKey(runId: string, stepId: string): string {
+  return `workflow:${runId}:${stepId}`;
+}
+
+function workflowTargetOwner(runId: string, stepId: string): TargetClaimOwner {
+  return { ownerKind: 'workflow', ownerId: runId, operationId: workflowSendKey(runId, stepId) };
 }
 
 function requireAgent(map: Map<string, ChatAgent>, id: string): ChatAgent {
@@ -77,10 +262,6 @@ function requireAgent(map: Map<string, ChatAgent>, id: string): ChatAgent {
   return agent;
 }
 
-export function interpolate(input: string, context: ReadonlyMap<string, string>): string {
+function interpolate(input: string, context: Map<string, string>): string {
   return input.replace(/\{\{([\w.-]+)\}\}/g, (_match, key: string) => context.get(key) ?? `{{${key}}}`);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
