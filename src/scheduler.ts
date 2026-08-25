@@ -203,23 +203,23 @@ export async function markJobFailed(jobId: string, error: unknown): Promise<void
 }
 
 export async function reclaimStaleLeases(now = new Date()): Promise<number> {
-  const stale = await db.jobs.filter((job) => {
-    if (job.state !== 'claimed' && job.state !== 'running') return false;
-    const leaseTime = job.leaseUntil ? Date.parse(job.leaseUntil) : Number.NaN;
-    const expiredOrInvalid = !Number.isFinite(leaseTime) || leaseTime <= now.getTime();
-    const fromPriorBoot = job.leaseBootId !== RUNTIME_BOOT_ID;
-    return fromPriorBoot || expiredOrInvalid;
-  }).toArray();
+  // Boot identity, not wall-clock TTL, is the fencing authority. A same-boot operation may
+  // legitimately remain alive longer than LEASE_MS while ChatGPT is generating or the tab is
+  // loading. Reclaiming it solely because its timestamp aged out could release ownership under
+  // still-running code and permit a duplicate mutation. A new MV3 service-worker boot gets a
+  // different RUNTIME_BOOT_ID, so prior-boot ownership is immediately identifiable without a
+  // timeout. Legacy leases with no boot ID are intentionally treated as prior-boot ownership.
+  const stale = await db.jobs.filter((job) =>
+    (job.state === 'claimed' || job.state === 'running')
+    && job.leaseBootId !== RUNTIME_BOOT_ID,
+  ).toArray();
 
   for (const staleJob of stale) {
-    const fromPriorBoot = staleJob.leaseBootId !== RUNTIME_BOOT_ID;
     await replaceJob(staleJob.id, (job) => {
       job.state = staleJob.state === 'running' ? 'reconciling' : 'pending';
       clearLease(job);
       if (staleJob.state === 'running') {
-        job.lastError = fromPriorBoot
-          ? 'Previous MV3 worker boot ended after execution started; reconciling persisted send intent before any retry.'
-          : 'Worker lease expired after execution started; reconciling persisted send intent before any retry.';
+        job.lastError = 'Previous MV3 worker boot ended after execution started; reconciling persisted send intent before any retry.';
       } else {
         delete job.lastError;
       }
