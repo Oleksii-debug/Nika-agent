@@ -2,6 +2,7 @@ import type { ChatAgent, ChatState, ContentCommand, ContentResult, RunSource, St
 import type { SendIntent } from './db';
 import { appendLog } from './storage';
 import { evaluateSendEffectProof } from './effect-proof';
+import { describeRouteMismatch, sameChatRoute } from './route-identity';
 import { getOrCreateSendIntent, setSendIntentState, settleSendIntentEffectProof } from './send-intents';
 
 const agentQueues = new Map<string, Promise<void>>();
@@ -65,6 +66,7 @@ export async function sendToAgent(
     const status = await contentCommand(tabId, { type: 'status' }, { recover: true });
     if (!status.ok || !status.evidence) throw new Error(status.ok ? 'Chat state evidence is unavailable.' : status.error);
     if (status.evidence.state !== 'idle') throw blockedError(agent.id, status.evidence);
+    assertExpectedAgentRoute(agent, status.evidence);
 
     const intentInput: Parameters<typeof getOrCreateSendIntent>[0] = {
       agentId: agent.id,
@@ -84,12 +86,23 @@ export async function sendToAgent(
       if (presence === 'ambiguous') throw new Error('SEND_AMBIGUOUS: persisted send intent cannot be causally reconciled.');
     }
 
+    // Re-observe immediately before crossing into DISPATCHING. This closes the
+    // runtime-side navigation race; the content script repeats the same fence
+    // at the final click/Enter boundary after composer stability verification.
+    const preDispatchStatus = await contentCommand(tabId, { type: 'status' }, { recover: true });
+    if (!preDispatchStatus.ok || !preDispatchStatus.evidence) {
+      throw new Error(preDispatchStatus.ok ? 'Pre-dispatch route evidence is unavailable.' : preDispatchStatus.error);
+    }
+    if (preDispatchStatus.evidence.state !== 'idle') throw blockedError(agent.id, preDispatchStatus.evidence);
+    assertExpectedAgentRoute(agent, preDispatchStatus.evidence);
+
     await setSendIntentState(intent.id, 'dispatching');
     const result = await contentCommand(tabId, {
       type: 'send',
       prompt: intent.prompt,
       promptHash: intent.promptHash,
       baselineUserTurnCount: intent.baselineUserTurnCount,
+      expectedPageUrl: agent.url,
     }, { recover: false });
 
     if (!result.ok) {
@@ -121,6 +134,13 @@ export async function reconcileSendIntent(agent: ChatAgent, intent: SendIntent):
 
 async function reconcileSendIntentUnlocked(agent: ChatAgent, intent: SendIntent): Promise<'confirmed' | 'absent' | 'ambiguous'> {
   const tabId = await ensureAgentTab(agent);
+  const routeStatus = await contentCommand(tabId, { type: 'status' }, { recover: true });
+  if (!routeStatus.ok || !routeStatus.evidence?.pageUrl || !sameChatRoute(agent.url, routeStatus.evidence.pageUrl)) {
+    const observed = routeStatus.ok ? routeStatus.evidence?.pageUrl ?? '<missing>' : `<unavailable:${routeStatus.error}>`;
+    await setSendIntentState(intent.id, 'ambiguous', describeRouteMismatch(agent.url, observed));
+    return 'ambiguous';
+  }
+
   const result = await contentCommand(tabId, {
     type: 'verifyPrompt',
     promptHash: intent.promptHash,
@@ -226,6 +246,12 @@ export async function waitUntilIdle(tabId: number, timeoutMs: number, settleMs: 
     await sleep(1000);
   }
   throw new Error('Timed out waiting for ChatGPT to become stably idle.');
+}
+
+function assertExpectedAgentRoute(agent: ChatAgent, evidence: StateEvidence): void {
+  if (!evidence.pageUrl || !sameChatRoute(agent.url, evidence.pageUrl)) {
+    throw new Error(describeRouteMismatch(agent.url, evidence.pageUrl ?? '<missing>'));
+  }
 }
 
 function blockedError(agentId: string, evidence: StateEvidence): ChatSurfaceBlockedError {
