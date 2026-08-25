@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { fakeBrowser } from 'wxt/testing/fake-browser';
-import { db } from '../src/db';
+import { db, type AgentQuarantine } from '../src/db';
 import {
   clearAgentQuarantine,
   getActiveAgentQuarantine,
@@ -41,6 +41,13 @@ function evidence(blockerKind: NonNullable<StateEvidence['blockerKind']>, state:
   };
 }
 
+const sharedAgents = [
+  agent('agent-a', 'https://chatgpt.com/c/shared'),
+  agent('agent-b', 'https://chatgpt.com/c/shared/?model=gpt-5#latest'),
+  agent('agent-c', 'https://chatgpt.com/c/other'),
+];
+const sharedTargetStorageKey = 'target:https://chatgpt.com/c/shared';
+
 describe('durable chat quarantine', () => {
   beforeEach(async () => {
     fakeBrowser.reset();
@@ -61,12 +68,7 @@ describe('durable chat quarantine', () => {
   it('persists manual quarantine until explicitly cleared', async () => {
     const now = new Date('2026-08-24T08:00:00.000Z');
     await quarantineAgent('agent-login', evidence('login', 'logged_out'), now);
-
-    expect(await getActiveAgentQuarantine('agent-login', new Date(now.getTime() + 24 * 60 * 60_000))).toMatchObject({
-      mode: 'manual',
-      blockerKind: 'login',
-    });
-
+    expect(await getActiveAgentQuarantine('agent-login', new Date(now.getTime() + 86_400_000))).toMatchObject({ mode: 'manual', blockerKind: 'login' });
     await clearAgentQuarantine('agent-login');
     expect(await getActiveAgentQuarantine('agent-login')).toBeUndefined();
   });
@@ -77,32 +79,40 @@ describe('durable chat quarantine', () => {
     expect(quarantine?.resumeAt).toBe('2026-08-24T09:00:00.000Z');
     expect(await getActiveAgentQuarantine('agent-rate', new Date('2026-08-24T08:59:59.000Z'))).toBeDefined();
     expect(await getActiveAgentQuarantine('agent-rate', new Date('2026-08-24T09:00:00.000Z'))).toBeUndefined();
-    expect(await db.agentQuarantines.get('agent-rate')).toBeUndefined();
   });
 
-  it('projects one physical target quarantine across URL aliases and clears them together', async () => {
-    await chrome.storage.local.set({
-      'nika.agents': [
-        agent('agent-a', 'https://chatgpt.com/c/shared'),
-        agent('agent-b', 'https://chatgpt.com/c/shared/?model=gpt-5#latest'),
-        agent('agent-c', 'https://chatgpt.com/c/other'),
-      ],
-    });
-
+  it('stores exactly one authoritative record for all aliases of one physical target', async () => {
+    await chrome.storage.local.set({ 'nika.agents': sharedAgents });
     await quarantineAgent('agent-a', evidence('verification', 'verification_required'));
 
-    expect(await getActiveAgentQuarantine('agent-b')).toMatchObject({
-      agentId: 'agent-b',
-      blockerKind: 'verification',
-      mode: 'manual',
-    });
+    expect(await getActiveAgentQuarantine('agent-b')).toMatchObject({ agentId: 'agent-b', blockerKind: 'verification', mode: 'manual' });
     expect(await getActiveAgentQuarantine('agent-c')).toBeUndefined();
-    expect(await db.agentQuarantines.get('agent-a')).toBeDefined();
-    expect(await db.agentQuarantines.get('agent-b')).toBeDefined();
+    expect(await db.agentQuarantines.get(sharedTargetStorageKey)).toBeDefined();
+    expect(await db.agentQuarantines.get('agent-a')).toBeUndefined();
+    expect(await db.agentQuarantines.get('agent-b')).toBeUndefined();
+    expect(await db.agentQuarantines.count()).toBe(1);
 
     await clearAgentQuarantine('agent-b');
     expect(await getActiveAgentQuarantine('agent-a')).toBeUndefined();
+    expect(await db.agentQuarantines.get(sharedTargetStorageKey)).toBeUndefined();
+  });
+
+  it('lazily migrates legacy per-agent projections into one target authority', async () => {
+    await chrome.storage.local.set({ 'nika.agents': sharedAgents });
+    const legacy: AgentQuarantine = {
+      agentId: 'agent-a',
+      state: 'verification_required',
+      blockerKind: 'verification',
+      mode: 'manual',
+      createdAt: '2026-08-24T08:00:00.000Z',
+      updatedAt: '2026-08-24T08:00:00.000Z',
+    };
+    await db.agentQuarantines.bulkPut([legacy, { ...legacy, agentId: 'agent-b' }]);
+
+    expect(await getActiveAgentQuarantine('agent-b')).toMatchObject({ agentId: 'agent-b', blockerKind: 'verification' });
+    expect(await db.agentQuarantines.get(sharedTargetStorageKey)).toBeDefined();
     expect(await db.agentQuarantines.get('agent-a')).toBeUndefined();
     expect(await db.agentQuarantines.get('agent-b')).toBeUndefined();
+    expect(await db.agentQuarantines.count()).toBe(1);
   });
 });
