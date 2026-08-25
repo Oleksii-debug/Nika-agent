@@ -5,6 +5,12 @@ import { join, resolve } from 'node:path';
 
 const EXTENSION_PATH = resolve('.output/chrome-mv3');
 
+type CdpTargetInfo = {
+  targetId: string;
+  type: string;
+  url: string;
+};
+
 async function launchExtension(): Promise<{ context: BrowserContext; worker: Worker; extensionId: string }> {
   const userDataDir = await mkdtemp(join(tmpdir(), 'nika-pw-worker-'));
   const context = await chromium.launchPersistentContext(userDataDir, {
@@ -24,6 +30,26 @@ async function bootIdentity(worker: Worker): Promise<{ token: string; timeOrigin
     token: crypto.randomUUID(),
     timeOrigin: performance.timeOrigin,
   }));
+}
+
+async function terminateBackgroundWorker(context: BrowserContext, worker: Worker): Promise<void> {
+  const browser = context.browser();
+  if (!browser) throw new Error('Persistent Chromium context has no owning Browser instance.');
+
+  const cdp = await browser.newBrowserCDPSession();
+  try {
+    const response = await cdp.send('Target.getTargets') as { targetInfos?: CdpTargetInfo[] };
+    const target = response.targetInfos?.find((candidate) =>
+      candidate.type === 'service_worker' && candidate.url === worker.url(),
+    );
+    if (!target) throw new Error(`MV3 service-worker CDP target not found for ${worker.url()}.`);
+
+    const closed = worker.waitForEvent('close');
+    await cdp.send('Target.closeTarget', { targetId: target.targetId });
+    await closed;
+  } finally {
+    await cdp.detach();
+  }
 }
 
 async function wakeBackground(context: BrowserContext, extensionId: string): Promise<Worker> {
@@ -49,15 +75,12 @@ test('MV3 runtime restart produces a distinct worker boot before recovery work c
   const { context, worker, extensionId } = await launchExtension();
   try {
     const firstBoot = await bootIdentity(worker);
-    const closed = worker.waitForEvent('close');
 
-    // ServiceWorkerGlobalScope has no close() API. chrome.runtime.reload() is a deterministic
-    // forced extension-runtime restart: the old MV3 worker/context is destroyed while durable
-    // browser storage survives, making it a conservative lifecycle oracle for restart recovery.
-    await worker.evaluate(() => {
-      chrome.runtime.reload();
-    });
-    await closed;
+    // Kill only the current service-worker target. Unlike chrome.runtime.reload(), this keeps
+    // the extension and Playwright BrowserContext alive while ending the in-memory MV3 worker
+    // lifetime. Durable browser storage and extension identity remain unchanged.
+    await terminateBackgroundWorker(context, worker);
+    expect(context.isClosed()).toBe(false);
 
     const restartedWorker = await wakeBackground(context, extensionId);
     const secondBoot = await bootIdentity(restartedWorker);
