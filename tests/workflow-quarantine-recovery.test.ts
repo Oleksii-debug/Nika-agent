@@ -1,5 +1,6 @@
 import 'fake-indexeddb/auto';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { clearAgentQuarantine } from '../src/chat-quarantine';
 import { db, type DurableWorkflowRun } from '../src/db';
 import {
   listClearedQuarantineWorkflowWaiters,
@@ -85,8 +86,11 @@ describe('workflow quarantine recovery', () => {
 
     expect(await listClearedQuarantineWorkflowWaiters()).toEqual([]);
 
-    // Models operator clear followed by MV3 worker loss before nika.quarantineCleared is delivered.
-    await db.agentQuarantines.delete('agent-a');
+    // Use the public clear operation because the preceding read may lazily migrate
+    // the legacy per-agent record to canonical physical-target authority.
+    // This models operator clear followed by MV3 worker loss before
+    // nika.quarantineCleared is delivered.
+    await clearAgentQuarantine('agent-a');
 
     expect((await listClearedQuarantineWorkflowWaiters()).map((item) => item.id)).toEqual(['restart-recovery']);
   });
