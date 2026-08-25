@@ -4,6 +4,11 @@ import type { ChatAgent } from './types';
 
 const LEASE_MS = 2 * 60_000;
 const SAFETY_WAKE_MINUTES = 1;
+const RUNTIME_BOOT_ID = crypto.randomUUID();
+
+export function getRuntimeBootId(): string {
+  return RUNTIME_BOOT_ID;
+}
 
 export async function synchronizeSchedules(agents: ChatAgent[], now = new Date()): Promise<void> {
   const enabledIds = new Set(agents.filter((agent) => agent.enabled && agent.schedule.enabled).map((agent) => agent.id));
@@ -37,7 +42,7 @@ export async function rebuildWakeAlarm(): Promise<void> {
 
 export async function reconcileSchedules(agents: ChatAgent[], now = new Date()): Promise<DurableJob[]> {
   await synchronizeSchedules(agents, now);
-  await reclaimExpiredLeases(now);
+  await reclaimStaleLeases(now);
   const byId = new Map(agents.map((agent) => [agent.id, agent]));
   const cursors = await db.scheduleCursors.toArray();
   const materialized: DurableJob[] = [];
@@ -101,6 +106,9 @@ export async function enqueueManualAgent(agentId: string, prompt?: string): Prom
 }
 
 export async function claimNextDueJob(now = new Date()): Promise<DurableJob | undefined> {
+  // A browser event can wake a fresh MV3 worker before startup/install reconciliation finishes.
+  // Fence stale leases here too, so prior-worker ownership cannot block or race a new claim.
+  await reclaimStaleLeases(now);
   const worker = crypto.randomUUID();
   return db.transaction('rw', db.jobs, async () => {
     const candidates = await db.jobs
@@ -111,14 +119,26 @@ export async function claimNextDueJob(now = new Date()): Promise<DurableJob | un
     if (!job) return undefined;
     const activeForAgent = await db.jobs.where('agentId').equals(job.agentId).filter((candidate) =>
       candidate.id !== job.id
-      && (candidate.state === 'claimed' || candidate.state === 'running' || candidate.state === 'reconciling')
-      && (!candidate.leaseUntil || Date.parse(candidate.leaseUntil) > now.getTime()),
+      && (candidate.state === 'claimed' || candidate.state === 'running' || candidate.state === 'reconciling'),
     ).first();
     if (activeForAgent) return undefined;
     const leaseUntil = new Date(now.getTime() + LEASE_MS).toISOString();
     const updatedAt = now.toISOString();
-    await db.jobs.update(job.id, { state: 'claimed', leaseOwner: worker, leaseUntil, updatedAt });
-    return { ...job, state: 'claimed', leaseOwner: worker, leaseUntil, updatedAt };
+    await db.jobs.update(job.id, {
+      state: 'claimed',
+      leaseOwner: worker,
+      leaseBootId: RUNTIME_BOOT_ID,
+      leaseUntil,
+      updatedAt,
+    });
+    return {
+      ...job,
+      state: 'claimed',
+      leaseOwner: worker,
+      leaseBootId: RUNTIME_BOOT_ID,
+      leaseUntil,
+      updatedAt,
+    };
   });
 }
 
@@ -136,8 +156,7 @@ export async function markJobRunning(job: DurableJob, runId: string): Promise<vo
 export async function markJobReconciling(jobId: string, detail: string): Promise<void> {
   await replaceJob(jobId, (job) => {
     job.state = 'reconciling';
-    delete job.leaseOwner;
-    delete job.leaseUntil;
+    clearLease(job);
     job.lastError = detail;
   });
 }
@@ -145,8 +164,7 @@ export async function markJobReconciling(jobId: string, detail: string): Promise
 export async function markJobPending(jobId: string, detail?: string): Promise<void> {
   await replaceJob(jobId, (job) => {
     job.state = 'pending';
-    delete job.leaseOwner;
-    delete job.leaseUntil;
+    clearLease(job);
     if (detail === undefined) delete job.lastError;
     else job.lastError = detail;
   });
@@ -156,8 +174,7 @@ export async function deferJobUntil(jobId: string, dueAt: string, detail: string
   await replaceJob(jobId, (job) => {
     job.state = 'pending';
     job.dueAt = dueAt;
-    delete job.leaseOwner;
-    delete job.leaseUntil;
+    clearLease(job);
     job.lastError = detail;
   });
 }
@@ -165,8 +182,7 @@ export async function deferJobUntil(jobId: string, dueAt: string, detail: string
 export async function markJobNeedsReview(jobId: string, detail: string): Promise<void> {
   await replaceJob(jobId, (job) => {
     job.state = 'needs_review';
-    delete job.leaseOwner;
-    delete job.leaseUntil;
+    clearLease(job);
     job.lastError = detail;
   });
 }
@@ -174,36 +190,42 @@ export async function markJobNeedsReview(jobId: string, detail: string): Promise
 export async function markJobSucceeded(jobId: string): Promise<void> {
   await replaceJob(jobId, (job) => {
     job.state = 'succeeded';
-    delete job.leaseOwner;
-    delete job.leaseUntil;
+    clearLease(job);
   });
 }
 
 export async function markJobFailed(jobId: string, error: unknown): Promise<void> {
   await replaceJob(jobId, (job) => {
     job.state = 'failed';
-    delete job.leaseOwner;
-    delete job.leaseUntil;
+    clearLease(job);
     job.lastError = error instanceof Error ? error.message : String(error);
   });
 }
 
-async function reclaimExpiredLeases(now: Date): Promise<void> {
-  const leased = await db.jobs.filter((job) =>
-    (job.state === 'claimed' || job.state === 'running')
-    && !!job.leaseUntil
-    && Date.parse(job.leaseUntil) <= now.getTime(),
-  ).toArray();
-  for (const leasedJob of leased) {
-    await replaceJob(leasedJob.id, (job) => {
-      job.state = leasedJob.state === 'running' ? 'reconciling' : 'pending';
-      delete job.leaseOwner;
-      delete job.leaseUntil;
-      if (leasedJob.state === 'running') {
-        job.lastError = 'Worker lease expired after execution started; reconciling persisted send intent before retry.';
+export async function reclaimStaleLeases(now = new Date()): Promise<number> {
+  const stale = await db.jobs.filter((job) => {
+    if (job.state !== 'claimed' && job.state !== 'running') return false;
+    const leaseTime = job.leaseUntil ? Date.parse(job.leaseUntil) : Number.NaN;
+    const expiredOrInvalid = !Number.isFinite(leaseTime) || leaseTime <= now.getTime();
+    const fromPriorBoot = job.leaseBootId !== RUNTIME_BOOT_ID;
+    return fromPriorBoot || expiredOrInvalid;
+  }).toArray();
+
+  for (const staleJob of stale) {
+    const fromPriorBoot = staleJob.leaseBootId !== RUNTIME_BOOT_ID;
+    await replaceJob(staleJob.id, (job) => {
+      job.state = staleJob.state === 'running' ? 'reconciling' : 'pending';
+      clearLease(job);
+      if (staleJob.state === 'running') {
+        job.lastError = fromPriorBoot
+          ? 'Previous MV3 worker boot ended after execution started; reconciling persisted send intent before any retry.'
+          : 'Worker lease expired after execution started; reconciling persisted send intent before any retry.';
+      } else {
+        delete job.lastError;
       }
     }, now.toISOString());
   }
+  return stale.length;
 }
 
 async function replaceJob(jobId: string, mutate: (job: DurableJob) => void, updatedAt = new Date().toISOString()): Promise<void> {
@@ -212,6 +234,12 @@ async function replaceJob(jobId: string, mutate: (job: DurableJob) => void, upda
   mutate(job);
   job.updatedAt = updatedAt;
   await db.jobs.put(job);
+}
+
+function clearLease(job: DurableJob): void {
+  delete job.leaseOwner;
+  delete job.leaseBootId;
+  delete job.leaseUntil;
 }
 
 function initialDueAt(agent: ChatAgent, now: Date): string | undefined {
