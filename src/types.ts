@@ -92,6 +92,19 @@ export type PromptPresenceResult = {
   detail?: string;
 };
 
+export type EffectProofOutcome = 'confirmed' | 'no_effect' | 'ambiguous';
+
+export type EffectProofObservation = {
+  outcome: EffectProofOutcome;
+  baselinePageUrl?: string;
+  observedPageUrl?: string;
+  baselineUserTurnCount: number;
+  observedUserTurnCount: number;
+  matches: number;
+  observedAt: string;
+  detail?: string;
+};
+
 export type ContentCommand =
   | { type: 'status' }
   | { type: 'send'; prompt: string; promptHash?: string; baselineUserTurnCount?: number }
