@@ -50,7 +50,7 @@ describe('operator recovery', () => {
     expect(persistedClaim?.ownerId).toBe('job-restart');
     expect(persistedClaim?.operationId).toBe('job:job-restart');
 
-    const recovery = (await listRecoveryCases()).find((item) => item.subjectId === 'job-restart');
+    const recovery = (await listRecoveryCases()).find((item) => item.id === 'job-restart');
     if (!recovery) throw new Error('Expected the unresolved restarted job to remain an operator recovery case.');
     expect(recovery.allowedActions).not.toContain('release_if_safe');
     expect(recovery.allowedActions).not.toContain('cancel');
