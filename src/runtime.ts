@@ -140,17 +140,17 @@ async function waitForTabComplete(tabId: number, timeoutMs: number): Promise<voi
   const current = await chrome.tabs.get(tabId);
   if (current.status === 'complete') return;
   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(listener);
-      reject(new Error('Timed out loading ChatGPT tab.'));
-    }, timeoutMs);
-    const listener = (updatedId: number, info: chrome.tabs.TabChangeInfo) => {
+    const listener: Parameters<typeof chrome.tabs.onUpdated.addListener>[0] = (updatedId, info) => {
       if (updatedId === tabId && info.status === 'complete') {
         clearTimeout(timer);
         chrome.tabs.onUpdated.removeListener(listener);
         resolve();
       }
     };
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error('Timed out loading ChatGPT tab.'));
+    }, timeoutMs);
     chrome.tabs.onUpdated.addListener(listener);
   });
 }
