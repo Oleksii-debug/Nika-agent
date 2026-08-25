@@ -56,6 +56,42 @@ export interface ExecutionLog {
   detail?: string;
 }
 
+export type RunState =
+  | 'queued'
+  | 'running'
+  | 'sleeping'
+  | 'completed'
+  | 'failed'
+  | 'needs_reconciliation';
+
+export type RunStepState = 'pending' | 'executing' | 'completed';
+
+export interface RunRecord {
+  runId: string;
+  workflowId: string;
+  currentStepIndex: number;
+  currentStepId?: string;
+  stepState: RunStepState;
+  state: RunState;
+  targetChatId?: string;
+  context: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
+  wakeAt?: string;
+  retryCount: number;
+  correlationId: string;
+  leaseOwner?: string;
+  leaseExpiresAt?: string;
+  error?: string;
+}
+
+export interface AgentLease {
+  agentId: string;
+  ownerRunId: string;
+  acquiredAt: string;
+  expiresAt: string;
+}
+
 export type ContentCommand =
   | { type: 'status' }
   | { type: 'send'; prompt: string }
