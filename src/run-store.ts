@@ -42,8 +42,12 @@ export async function saveRunRecord(record: RunRecord): Promise<void> {
   await nikaDb.runs.put({ ...record, updatedAt: new Date().toISOString() });
 }
 
+export async function listActiveRuns(): Promise<RunRecord[]> {
+  return nikaDb.runs.where('state').anyOf('queued', 'running', 'sleeping', 'needs_reconciliation').toArray();
+}
+
 export async function listRecoverableRuns(now = new Date()): Promise<RunRecord[]> {
-  const candidates = await nikaDb.runs.where('state').anyOf('queued', 'running', 'sleeping', 'needs_reconciliation').toArray();
+  const candidates = await listActiveRuns();
   const timestamp = now.getTime();
   return candidates.filter((run) => run.state !== 'sleeping' || !run.wakeAt || Date.parse(run.wakeAt) <= timestamp);
 }
