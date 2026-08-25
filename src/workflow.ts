@@ -12,6 +12,8 @@ import type { ChatAgent, RunRecord, WorkflowDefinition, WorkflowStep } from './t
 export const RUN_ALARM_PREFIX = 'run:';
 const LEASE_RETRY_MS = 5_000;
 
+export type ReconciliationResolution = 'assume_completed' | 'retry' | 'fail';
+
 export async function runWorkflow(workflow: WorkflowDefinition): Promise<string> {
   const run = await createRunRecord(workflow.id);
   await appendLog({ workflowId: workflow.id, runId: run.runId, level: 'info', event: 'workflow_started' });
@@ -20,11 +22,84 @@ export async function runWorkflow(workflow: WorkflowDefinition): Promise<string>
 }
 
 export async function resumeWorkflow(workflow: WorkflowDefinition, runId: string): Promise<void> {
+  const run = await requireRun(workflow, runId);
+  if (run.state === 'completed' || run.state === 'failed' || run.state === 'needs_reconciliation') return;
+  await executeRun(workflow, run);
+}
+
+export async function reconcileWorkflowRun(
+  workflow: WorkflowDefinition,
+  runId: string,
+  resolution: ReconciliationResolution,
+): Promise<void> {
+  const run = await requireRun(workflow, runId);
+  if (run.state !== 'needs_reconciliation') {
+    throw new Error(`Run '${runId}' does not require reconciliation.`);
+  }
+
+  const step = workflow.steps[run.currentStepIndex];
+  if (!step || !run.currentStepId || step.id !== run.currentStepId) {
+    throw new Error(`Run '${runId}' cannot be reconciled because its persisted step no longer matches the workflow.`);
+  }
+
+  if (resolution === 'fail') {
+    run.state = 'failed';
+    run.stepState = 'completed';
+    run.wakeAt = undefined;
+    run.error = `Run manually failed while reconciling ambiguous step '${step.id}'.`;
+    await saveRunRecord(run);
+    await appendLog({
+      workflowId: workflow.id,
+      runId: run.runId,
+      stepId: step.id,
+      level: 'warning',
+      event: 'workflow_reconciliation_failed',
+      detail: run.error,
+    });
+    return;
+  }
+
+  if (resolution === 'assume_completed') {
+    run.currentStepIndex += 1;
+    run.currentStepId = undefined;
+    run.targetChatId = undefined;
+    run.stepState = 'pending';
+    run.state = 'queued';
+    run.wakeAt = undefined;
+    run.error = undefined;
+    await saveRunRecord(run);
+    await appendLog({
+      workflowId: workflow.id,
+      runId: run.runId,
+      stepId: step.id,
+      level: 'warning',
+      event: 'workflow_reconciliation_assumed_completed',
+      detail: 'Operator confirmed the ambiguous side effect should not be replayed.',
+    });
+  } else {
+    run.stepState = 'pending';
+    run.state = 'queued';
+    run.wakeAt = undefined;
+    run.error = undefined;
+    await saveRunRecord(run);
+    await appendLog({
+      workflowId: workflow.id,
+      runId: run.runId,
+      stepId: step.id,
+      level: 'warning',
+      event: 'workflow_reconciliation_retry_authorized',
+      detail: 'Operator explicitly authorized replay of the ambiguous side effect.',
+    });
+  }
+
+  await executeRun(workflow, run);
+}
+
+async function requireRun(workflow: WorkflowDefinition, runId: string): Promise<RunRecord> {
   const run = await getRunRecord(runId);
   if (!run) throw new Error(`Run '${runId}' was not found.`);
   if (run.workflowId !== workflow.id) throw new Error(`Run '${runId}' does not belong to workflow '${workflow.id}'.`);
-  if (run.state === 'completed' || run.state === 'failed' || run.state === 'needs_reconciliation') return;
-  await executeRun(workflow, run);
+  return run;
 }
 
 async function executeRun(workflow: WorkflowDefinition, run: RunRecord): Promise<void> {
