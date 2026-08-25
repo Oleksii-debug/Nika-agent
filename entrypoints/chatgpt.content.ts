@@ -1,4 +1,5 @@
 import { classifyChatSurface } from '../src/chatgpt-state';
+import { describeRouteMismatch, sameChatRoute } from '../src/route-identity';
 import {
   buildTextWriteEvidence,
   detectEditorKind,
@@ -287,9 +288,17 @@ async function setComposerText(prompt: string): Promise<TextWriteEvidence | null
   return buildTextWriteEvidence(prompt, readEditorText(editor), editorKind, strategy);
 }
 
-async function sendPrompt(prompt: string, promptHash?: string, baselineUserTurnCount?: number): Promise<ContentResult> {
+async function sendPrompt(
+  prompt: string,
+  promptHash?: string,
+  baselineUserTurnCount?: number,
+  expectedPageUrl?: string,
+): Promise<ContentResult> {
   const evidence = inspectState();
   if (evidence.state !== 'idle') return { ok: false, error: describeUnsafeState(evidence), evidence };
+  if (expectedPageUrl && (!evidence.pageUrl || !sameChatRoute(expectedPageUrl, evidence.pageUrl))) {
+    return { ok: false, error: describeRouteMismatch(expectedPageUrl, evidence.pageUrl ?? '<missing>'), evidence };
+  }
 
   const writeEvidence = await setComposerText(prompt);
   if (!writeEvidence) return { ok: false, error: 'Composer not found before text write.', evidence };
@@ -325,6 +334,13 @@ async function sendPrompt(prompt: string, promptHash?: string, baselineUserTurnC
   const preSubmitEvidence = inspectState();
   if (preSubmitEvidence.state !== 'idle') {
     return { ok: false, error: `Chat became unsafe before submit: ${describeUnsafeState(preSubmitEvidence)}`, evidence: preSubmitEvidence };
+  }
+  if (expectedPageUrl && (!preSubmitEvidence.pageUrl || !sameChatRoute(expectedPageUrl, preSubmitEvidence.pageUrl))) {
+    return {
+      ok: false,
+      error: `${describeRouteMismatch(expectedPageUrl, preSubmitEvidence.pageUrl ?? '<missing>')}. Submit was not attempted.`,
+      evidence: preSubmitEvidence,
+    };
   }
 
   const send = firstElement<HTMLButtonElement>(SELECTORS.send);
@@ -412,7 +428,7 @@ async function handleCommand(command: ContentCommand): Promise<ContentResult> {
       return { ok: true, state: evidence.state, evidence };
     }
     case 'send':
-      return sendPrompt(command.prompt, command.promptHash, command.baselineUserTurnCount);
+      return sendPrompt(command.prompt, command.promptHash, command.baselineUserTurnCount, command.expectedPageUrl);
     case 'verifyPrompt':
       return verifyPrompt(command.promptHash, command.baselineUserTurnCount);
     case 'captureLatest':
